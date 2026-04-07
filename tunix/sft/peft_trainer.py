@@ -68,6 +68,10 @@ class TrainingConfig:
   # Configs for the metrics logger.
   metrics_logging_options: MetricsLoggerOptions | None = None
 
+  # If True, the trainer will skip internal sharding of the optimizer.
+  # This is useful when the optimizer is already pre-sharded.
+  skip_sharding_optimizer: bool = False
+
   # Configs for the profiler.
   profiler_options: profiler.ProfilerOptions | None = None
 
@@ -195,14 +199,24 @@ class PeftTrainer:
     self.model = model
     self.config = training_config
     self._lora_enabled = utils.is_lora_enabled(self.model)
-    if training_config.gradient_accumulation_steps is not None:
-      optimizer = optax.MultiSteps(
-          optimizer, training_config.gradient_accumulation_steps
-      )
-    if self._lora_enabled:
-      self.optimizer = nnx.Optimizer(self.model, optimizer, wrt=nnx.LoRAParam)
+
+    if self.config.skip_sharding_optimizer:
+      if not isinstance(optimizer, nnx.Optimizer):
+        raise ValueError(
+            "skip_sharding_optimizer is True, but optimizer is not an "
+            "nnx.Optimizer instance. Pre-instantiated optimizer is required "
+            "when skipping sharding."
+        )
+      self.optimizer = optimizer
     else:
-      self.optimizer = nnx.Optimizer(self.model, optimizer, wrt=nnx.Param)
+      if training_config.gradient_accumulation_steps is not None:
+        optimizer = optax.MultiSteps(
+            optimizer, training_config.gradient_accumulation_steps
+        )
+      if self._lora_enabled:
+        self.optimizer = nnx.Optimizer(self.model, optimizer, wrt=nnx.LoRAParam)
+      else:
+        self.optimizer = nnx.Optimizer(self.model, optimizer, wrt=nnx.Param)
 
     self.loss_fn = _default_loss_fn
     self.eval_loss_fn = _default_loss_fn
@@ -373,9 +387,10 @@ class PeftTrainer:
     Args:
       mesh: The mesh used for sharding.
     """
-    if mesh.empty:
+    if mesh.empty or self.config.skip_sharding_optimizer:
       return
     optimizer_state = nnx.state(self.optimizer, nnx.optimizer.OptState)
+
     optimizer_pspecs = nnx.get_partition_spec(optimizer_state)
 
     optimizer_sharded_state = jax.lax.with_sharding_constraint(

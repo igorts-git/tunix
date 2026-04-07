@@ -652,6 +652,45 @@ class PeftTrainerTest(parameterized.TestCase):
         TEST_LEARNING_RATE,
     )
 
+  def test_skip_sharding_optimizer_success(self):
+    """Test that PeftTrainer accepts pre-instantiated nnx.Optimizer when skip_sharding_optimizer is True."""
+    rngs = nnx.Rngs(0)
+    model = tc.ToyTransformer(config=tc.ModelConfig(), rngs=rngs)
+    config = peft_trainer.TrainingConfig(
+        skip_sharding_optimizer=True, eval_every_n_steps=2
+    )
+
+    # Pre-instantiate nnx.Optimizer
+    base_optimizer = optax.sgd(1e-3)
+    nnx_optimizer = nnx.Optimizer(model, base_optimizer, wrt=nnx.Param)
+
+    trainer = peft_trainer.PeftTrainer(model, nnx_optimizer, config)
+    self.assertIs(trainer.optimizer, nnx_optimizer)
+    with mock.patch(
+        'jax.lax.with_sharding_constraint'
+    ) as mock_sharding_constraint:
+      trainer._shard_optimizer(self.mesh)
+      # when skip_sharding_optimizer is True, PeftTrainer._shard_optimizer returns early
+      mock_sharding_constraint.assert_not_called()
+
+  def test_skip_sharding_optimizer_validation(self):
+    """Test that PeftTrainer raises ValueError if skip_sharding_optimizer is True but optimizer is not nnx.Optimizer."""
+    rngs = nnx.Rngs(0)
+    model = tc.ToyTransformer(config=tc.ModelConfig(), rngs=rngs)
+    config = peft_trainer.TrainingConfig(
+        skip_sharding_optimizer=True, eval_every_n_steps=2
+    )
+
+    # Passing a raw optax optimizer instead of nnx.Optimizer should fail
+    optimizer = optax.sgd(1e-3)
+
+    with self.assertRaisesRegex(
+        ValueError,
+        'skip_sharding_optimizer is True, but optimizer is not an'
+        ' nnx.Optimizer instance',
+    ):
+      peft_trainer.PeftTrainer(model, optimizer, config)
+
 
 if __name__ == '__main__':
   absltest.main()

@@ -330,6 +330,12 @@ class StandardRLProgram(RLProgram):
   ) -> None:
     """Launches all stages concurrently on event loop."""
     del kwargs
+    if self.sync_weights:
+      logging.info("Broadcasting initial weights from Trainer to Rollout workers...")
+      new_version = await engine.sync_weights(role=datatypes.Role.ACTOR)
+      self.policy_version = new_version if new_version else 0
+      logging.info("Initial weights successfully synced to rollout workers (version=%d).", self.policy_version)
+
     logging.info("Starting StandardRLProgram concurrent stages...")
 
     train_task = asyncio.create_task(self.train_stage(engine, num_steps))

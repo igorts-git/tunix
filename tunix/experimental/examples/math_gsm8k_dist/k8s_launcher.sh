@@ -82,6 +82,7 @@ export GCS_SCRATCH_LOCATION=${GCS_SCRATCH_LOCATION:-gs://cloud-pathways-staging/
 # images) apply unless overridden.
 export PATHWAYS_SERVER_IMAGE=${PATHWAYS_SERVER_IMAGE:-}
 export PATHWAYS_PROXY_IMAGE=${PATHWAYS_PROXY_IMAGE:-}
+export PATHWAYS_INSTANCE_COUNT=${PATHWAYS_INSTANCE_COUNT:-}
 export TRAINER_JOBSET_YAML=${TRAINER_JOBSET_YAML:-jobset.pathways.yaml}
 export TRAINER_TPU_SLICE=${TRAINER_TPU_SLICE:-tpuv5:2x2x2}
 export TRAINER_MESH_FSDP=${TRAINER_MESH_FSDP:-8}
@@ -137,6 +138,9 @@ start_orchestrator() {
         --max_response_length=${MAX_RESPONSE_LENGTH} \
         --train_micro_batch_size=${TRAIN_MICRO_BATCH_SIZE} \
         --num_rollout_workers=${ROLLOUT_REPLICAS} \
+        --reward_mode=${REWARD_MODE} \
+        --temperature=0.7 \
+        --top_p=0.95 \
         --sync_weights \
         --stop_workers_on_exit \
     " \
@@ -154,6 +158,7 @@ start_trainer() {
     --tpu_slice=${TRAINER_TPU_SLICE} \
     --cpu_machine=${CPU_MACHINE} \
     --pathways_gcs_scratch_location=${GCS_SCRATCH_LOCATION} \
+    ${PATHWAYS_INSTANCE_COUNT:+--pathways_instance_count=${PATHWAYS_INSTANCE_COUNT}} \
     ${PATHWAYS_SERVER_IMAGE:+--pathways_server_image=${PATHWAYS_SERVER_IMAGE}} \
     ${PATHWAYS_PROXY_IMAGE:+--pathways_proxy_server_image=${PATHWAYS_PROXY_IMAGE}} \
     --worker_container_image="${TUNIX_IMAGE}" \

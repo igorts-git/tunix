@@ -177,13 +177,24 @@ def _make_reward_fn(mode: str, num_generations: int):
 
   def reward_fn(item: datatypes.TrajectoryItem) -> float:
     metadata = dict(item.metadata or {})
+    text = str(metadata.get("text", ""))
+    extracted = _extract_answer(text)
     if mode == "synthetic":
       pair_index = int(metadata.get("pair_index", item.pair_index))
-      return pair_index / max(num_generations - 1, 1)
+      reward = pair_index / max(num_generations - 1, 1)
+      logging.info(
+          "[Rollout Sample] (synthetic) pair=%d reward=%.2f text_len=%d snippet=%r",
+          pair_index, reward, len(text), text[:300]
+      )
+      return reward
 
-    text = str(metadata.get("text", ""))
     gold_answer = metadata.get("gold_answer")
-    return 1.0 if gold_answer and _extract_answer(text) == gold_answer else 0.0
+    reward = 1.0 if gold_answer and extracted == gold_answer else 0.0
+    logging.info(
+        "[Rollout Sample] gold=%s extracted=%s match=%s reward=%.2f text_len=%d snippet=%r",
+        gold_answer, extracted, extracted == gold_answer, reward, len(text), text[:300]
+    )
+    return reward
 
   return reward_fn
 
@@ -375,13 +386,26 @@ def _register_workers(
 def _build_prompt_item(
     *,
     prompt_idx: int,
+    tokenizer: Any = None,
     max_response_length: int,
     temperature: float,
     top_p: float,
     top_k: int | None,
 ) -> dict[str, Any]:
   question, gold_answer = DEMO_TASKS[prompt_idx % len(DEMO_TASKS)]
-  prompt = PROMPT_TEMPLATE.format(question=question)
+  raw_prompt = (
+      "Solve the following math problem.\n"
+      "First, put your detailed step-by-step reasoning process inside <reasoning>...</reasoning> tags.\n"
+      "Then, put your final numerical answer inside <answer>\\boxed{}</answer> tags.\n\n"
+      f"Problem: {question}"
+  )
+  if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
+    messages = [{"role": "user", "content": raw_prompt}]
+    prompt = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+  else:
+    prompt = f"<|im_start|>user\n{raw_prompt}<|im_end|>\n<|im_start|>assistant\n"
   prompt_id = f"prompt_{prompt_idx}"
   return {
       "prompt": prompt,
@@ -409,11 +433,13 @@ def _build_prompt_item(
 
 def _iter_prompt_items(
     args: argparse.Namespace,
+    tokenizer: Any = None,
 ) -> Iterator[dict[str, Any]]:
   top_k = None if args.top_k < 0 else args.top_k
   for prompt_idx in range(args.max_steps * args.batch_size):
     yield _build_prompt_item(
         prompt_idx=prompt_idx,
+        tokenizer=tokenizer,
         max_response_length=args.max_response_length,
         temperature=args.temperature,
         top_p=args.top_p,
@@ -560,7 +586,7 @@ def main(argv: list[str], context: Any = None) -> None:
 
   program = rl_program.StandardRLProgram(
       algo=algo,
-      dataset=_iter_prompt_items(args),
+      dataset=_iter_prompt_items(args, tokenizer=tokenizer),
       reward_fns=[_make_reward_fn(args.reward_mode, args.num_generations)],
       assembler=batch_assembly.GRPOTrainExampleAssembler(
           batch_size=args.train_micro_batch_size,

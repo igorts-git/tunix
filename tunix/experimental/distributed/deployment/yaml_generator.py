@@ -58,6 +58,12 @@ def main() -> None:
       help="Pathways proxy server image",
   )
   parser.add_argument(
+      "--pathways_instance_count",
+      type=int,
+      default=None,
+      help="Number of TPU worker instances under Pathways",
+  )
+  parser.add_argument(
       "--pathways_gcs_scratch_location",
       default="gs://cloud-pathways-staging/tmp",
       help="GCS scratch location",
@@ -156,8 +162,11 @@ def main() -> None:
         TPU_TOPOLOGY=tpu_topology,
         PW_INSTANCE_TYPE=pw_instance_type,
         REPLICAS=1,
-        COMPLETIONS=num_chips // 4 if num_chips else None,
-        PARALLELISM=num_chips // 4 if num_chips else None,
+        PW_WORKER_REPLICAS=args.pathways_instance_count if args.pathways_instance_count else 1,
+        PW_WORKER_COMPLETIONS=1 if args.pathways_instance_count else (num_chips // 4 if num_chips else None),
+        PW_WORKER_PARALLELISM=1 if args.pathways_instance_count else (num_chips // 4 if num_chips else None),
+        COMPLETIONS=args.pathways_instance_count or (num_chips // 4 if num_chips else None),
+        PARALLELISM=args.pathways_instance_count or (num_chips // 4 if num_chips else None),
         PODSET_SLICE_TOPOLOGY=slice_topology,
         PODSET_SLICE_SIZE=slice_size,
         USER_CONTAINER=args.worker_container_name,

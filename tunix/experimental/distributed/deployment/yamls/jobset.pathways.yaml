@@ -73,7 +73,7 @@ spec:
               - --server_port=29001
               - --gcs_scratch_location=${GCS_SCRATCH_LOCATION}
               - --node_type=resource_manager
-              - --instance_count=${REPLICAS}
+              - --instance_count=${PW_WORKER_REPLICAS}
               - --instance_type=${PW_INSTANCE_TYPE}:${TPU_TOPOLOGY}
               env:
               - name: REPLICATED_JOB_NAME
@@ -189,13 +189,13 @@ spec:
               - containerPort: ${USER_CONTAINER_PORT}
                 name: grpc # Naming it 'grpc' tells GKE to optimize for HTTP/2
   - name: pw-node
-    replicas: ${REPLICAS}
+    replicas: ${PW_WORKER_REPLICAS}
     template:
       spec:
         backoffLimit: 2048000
         completionMode: Indexed
-        completions: ${COMPLETIONS}
-        parallelism: ${PARALLELISM}
+        completions: ${PW_WORKER_COMPLETIONS}
+        parallelism: ${PW_WORKER_PARALLELISM}
         template:
           metadata:
             annotations:
@@ -213,28 +213,19 @@ spec:
               cloud.google.com/gke-tpu-accelerator: ${TPU_TYPE}
               cloud.google.com/gke-tpu-topology: ${TPU_TOPOLOGY}
             affinity:
-              # place on nodes in the same nodepool
-              podAffinity:
+              podAntiAffinity:
                 requiredDuringSchedulingIgnoredDuringExecution:
-                - topologyKey: cloud.google.com/gke-nodepool
+                - topologyKey: kubernetes.io/hostname
                   labelSelector:
                     matchExpressions:
                     - key: jobset.sigs.k8s.io/jobset-name
                       operator: In
                       values:
                       - ${JOBSET_NAME}
-              # ensure exclusive access to the nodepool (among all jobsets created with this yaml)
-              podAntiAffinity:
-                requiredDuringSchedulingIgnoredDuringExecution:
-                - topologyKey: cloud.google.com/gke-nodepool
-                  labelSelector:
-                    matchExpressions:
-                    - key: jobset.sigs.k8s.io/jobset-name
-                      operator: Exists
-                    - key: jobset.sigs.k8s.io/jobset-name
-                      operator: NotIn
+                    - key: jobset.sigs.k8s.io/replicatedjob-name
+                      operator: In
                       values:
-                      - ${JOBSET_NAME}
+                      - pw-node
             # tolerations:
             # - key: "google.com/tpu"
             #   operator: "Equal"
@@ -284,9 +275,7 @@ spec:
                   fieldRef:
                     fieldPath: metadata.labels['jobset.sigs.k8s.io/coordinator']
               - name: MEGASCALE_COORDINATOR_ADDRESS
-                valueFrom:
-                  fieldRef:
-                    fieldPath: metadata.labels['jobset.sigs.k8s.io/coordinator']
+                value: "${JOBSET_NAME}-pw-node-0-0.${JOBSET_NAME}"
               ports:
               - containerPort: 29005
                 protocol: TCP

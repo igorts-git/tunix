@@ -310,6 +310,12 @@ def _build_maxtext_config(args, num_devices: int) -> Any:
   ]
   if args.maxtext_load_parameters_path:
     argv.append(f"load_parameters_path={args.maxtext_load_parameters_path}")
+  devices = jax.devices()
+  num_slices = len(set(getattr(d, "slice_index", 0) for d in devices))
+  num_devices_per_slice = num_devices // max(1, num_slices)
+  ici_fsdp = min(args.mesh_fsdp, num_devices_per_slice)
+  dcn_fsdp = max(1, args.mesh_fsdp // ici_fsdp)
+
   argv.extend([
       # checkpoint is scanned; weight-sync mapping converts to unscanned for rollout
       #
@@ -337,7 +343,8 @@ def _build_maxtext_config(args, num_devices: int) -> Any:
       "attention=dot_product",
       "use_tokamax_gmm=true",
       "use_gmm_v2=true",
-      f"ici_fsdp_parallelism={args.mesh_fsdp}",
+      f"ici_fsdp_parallelism={ici_fsdp}",
+      f"dcn_fsdp_parallelism={dcn_fsdp}",
       *(
           [f"padded_base_moe_mlp_dim={args.maxtext_padded_moe_mlp_dim}"]
           if args.maxtext_padded_moe_mlp_dim

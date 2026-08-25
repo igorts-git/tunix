@@ -103,6 +103,12 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
       ),
   )
   parser.add_argument(
+      "--maxtext_load_parameters_path",
+      type=str,
+      default="",
+      help="Orbax checkpoint directory path to restore weights directly.",
+  )
+  parser.add_argument(
       "--maxtext_attention",
       type=str,
       default="",
@@ -225,6 +231,8 @@ def _create_vllm_worker(args, tokenizer):
           "log_config": False,
           "weight_dtype": "bfloat16",
       }
+      if args.maxtext_load_parameters_path:
+        maxtext_config_overrides["load_parameters_path"] = args.maxtext_load_parameters_path
       if args.maxtext_attention:
         maxtext_config_overrides["attention"] = args.maxtext_attention
       engine_kwargs["additional_config"] = {

@@ -281,11 +281,14 @@ def _build_maxtext_config(args, num_devices: int) -> Any:
   """Builds the MaxText HyperParameters the training engine runs on."""
   pyconfig, _, _ = _maxtext_modules()
 
-  # MaxText shards the batch dim over fsdp; fail early instead of deep in the first step.
+  # When train_micro_batch_size % mesh_fsdp != 0, MaxTextTrainingEngine replicates
+  # the batch dimension across FSDP rather than sharding it.
   if args.train_micro_batch_size % args.mesh_fsdp:
-    raise ValueError(
-        f"--train_micro_batch_size={args.train_micro_batch_size} must be a multiple of "
-        f"--mesh_fsdp={args.mesh_fsdp}; MaxText shards the batch dimension across it."
+    logging.warning(
+        "--train_micro_batch_size=%d is not a multiple of --mesh_fsdp=%d; "
+        "MaxTextTrainingEngine will replicate the batch dimension across FSDP.",
+        args.train_micro_batch_size,
+        args.mesh_fsdp,
     )
   per_device_batch_size = args.train_micro_batch_size / num_devices
 

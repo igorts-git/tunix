@@ -14,6 +14,7 @@
 # limitations under the License.
 
 COMMAND=""
+PYTHON=${PYTHON:-python3}
 # No default: build an image with tunix, maxtext, and tpu-inference baked in
 # at pinned commits (see requirements/special_requirements.txt), then pass it
 # via TUNIX_IMAGE or --image.
@@ -116,7 +117,7 @@ stop_orchestrator() {
 }
 
 start_orchestrator() {
-  python tunix/experimental/distributed/deployment/yaml_generator.py \
+  ${PYTHON} tunix/experimental/distributed/deployment/yaml_generator.py \
     tunix/experimental/distributed/deployment/yamls/jobset.cpu.yaml \
     --jobset_name="${ORCHESTRATOR_ID}" \
     --cpu_machine=${CPU_MACHINE} \
@@ -147,7 +148,7 @@ stop_trainer() {
 }
 
 start_trainer() {
-  python tunix/experimental/distributed/deployment/yaml_generator.py \
+  ${PYTHON} tunix/experimental/distributed/deployment/yaml_generator.py \
     tunix/experimental/distributed/deployment/yamls/${TRAINER_JOBSET_YAML} \
     --jobset_name="${TRAINER_ID}" \
     --tpu_slice=${TRAINER_TPU_SLICE} \
@@ -195,7 +196,7 @@ stop_rollout() {
 start_rollout() {
   for i in $(seq 0 $((ROLLOUT_REPLICAS - 1))); do
     local replica_id="${ROLLOUT_ID}-${i}"
-    python tunix/experimental/distributed/deployment/yaml_generator.py \
+    ${PYTHON} tunix/experimental/distributed/deployment/yaml_generator.py \
       tunix/experimental/distributed/deployment/yamls/jobset.tpu.yaml \
       --jobset_name="${replica_id}" \
       --tpu_slice=${ROLLOUT_TPU_SLICE} \
@@ -249,6 +250,13 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ "$COMMAND" == "stop" ]]; then
+  stop_orchestrator
+  stop_trainer
+  stop_rollout
+  exit 0
+fi
+
 if [[ -z "$TUNIX_IMAGE" ]]; then
   echo "Error: no image set. Build one with tunix, maxtext, and" \
        "tpu-inference installed, then pass it via TUNIX_IMAGE=... or" \
@@ -263,10 +271,7 @@ if [[ "$COMMAND" == "start" ]]; then
   start_orchestrator
   start_trainer
   start_rollout
-elif [[ "$COMMAND" == "stop" ]]; then
-  stop_orchestrator
-  stop_trainer
-  stop_rollout
+
 elif [[ "$COMMAND" == "orchestrator" ]]; then
   stop_orchestrator; start_orchestrator
 elif [[ "$COMMAND" == "trainer" ]]; then

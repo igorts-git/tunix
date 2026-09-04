@@ -142,7 +142,7 @@ load_preset_defaults() {
       PRESET_ROLLOUT_TPU_SLICE="tpuv5:2x2x1"
       PRESET_ROLLOUT_TENSOR_PARALLEL_SIZE=2
       PRESET_ROLLOUT_MESH_TP=2
-      PRESET_ROLLOUT_REPLICAS=2
+      PRESET_ROLLOUT_REPLICAS=1
       PRESET_SAMPLER="vllm"
       PRESET_WEIGHT_SYNC_MODE="raiden"
       PRESET_USE_WEIGHT_CONVERTER=1
@@ -150,7 +150,7 @@ load_preset_defaults() {
       PRESET_VERIFY_WEIGHTS="true"
       PRESET_DISABLE_CHECKPOINTING="true"
       PRESET_MAX_STEPS=2
-      PRESET_DEFAULT_IMAGE="europe-west4-docker.pkg.dev/cloud-tpu-multipod-dev/rl-maxtext/igorts-maxtext:qwen35-20260904-v5"
+      PRESET_DEFAULT_IMAGE="europe-west4-docker.pkg.dev/cloud-tpu-multipod-dev/rl-maxtext/igorts-maxtext:qwen35-20260904-v12"
       ;;
     qwen3-1.7b|1.7b|1.7B)
       PRESET_NAME="qwen3-1.7b"
@@ -176,7 +176,7 @@ load_preset_defaults() {
       PRESET_VERIFY_WEIGHTS="true"
       PRESET_DISABLE_CHECKPOINTING="true"
       PRESET_MAX_STEPS=1
-      PRESET_DEFAULT_IMAGE="gcr.io/cloud-tpu-multipod-dev/yixuannwang_google_com-runner:yixuann-raiden-debug-0903-2"
+      PRESET_DEFAULT_IMAGE="europe-west4-docker.pkg.dev/cloud-tpu-multipod-dev/rl-maxtext/igorts-maxtext:qwen35-20260904-v5"
       ;;
     *)
       echo "Error: Unknown preset '$preset'. Available: qwen3-0.6b, qwen3.5-35b, qwen3-1.7b" >&2

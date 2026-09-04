@@ -302,10 +302,15 @@ class RaidenSynchronizer:
     )
 
     src_devices = mesh.devices.flatten()
-    num_processes = len(
-        set(getattr(d, "process_index", 0) for d in src_devices)
+    num_hosts = len(
+        set(
+            getattr(d, "task_id", None)
+            if getattr(d, "task_id", None) is not None
+            else getattr(d, "host_id", getattr(d, "process_index", 0))
+            for d in src_devices
+        )
     )
-    devices_per_host = len(src_devices) // max(1, num_processes)
+    devices_per_host = len(src_devices) // max(1, num_hosts)
 
     if is_d2h:
       logging.info(
@@ -525,7 +530,24 @@ class RaidenSynchronizer:
           else ""
       )
       num_shards = self._sync.num_shards if self._sync else 1
-      shards = (data_addr,) * num_shards if data_addr else ()
+      if self._sync and hasattr(self._sync, "get_local_endpoints"):
+        eps = self._sync.get_local_endpoints()
+        shard_list = [""] * num_shards
+        for ep_info in eps:
+          ep = ep_info.get("endpoint", "")
+          port = ep.rsplit(":", 1)[-1] if ":" in ep else ""
+          endpoint_addr = (
+              f"{self.ip}:{port}" if port and self.ip != "localhost" else ep
+          )
+          for s in ep_info.get("shards", []):
+            if 0 <= s < num_shards:
+              shard_list[s] = endpoint_addr
+        for i in range(num_shards):
+          if not shard_list[i]:
+            shard_list[i] = data_addr
+        shards = tuple(shard_list) if any(shard_list) else ()
+      else:
+        shards = (data_addr,) * num_shards if data_addr else ()
     # Index 0 keeps the default replica id "": transfer callers construct
     # WorkUnitId(job_name=...) without a replica, and registration lookups
     # must match it for single-replica units.

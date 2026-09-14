@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Builds and pushes the 3-file overlay image used by the Qwen3.5-35B-A3B RL run.
+# Builds and pushes the 4-file overlay image used by the Qwen3.5-35B-A3B RL run.
 #
 #   ./build_qwen35_overlay.sh [image-tag]
 #
-# Defaults to gcr.io/cloud-tpu-multipod-dev/${USER}-runner:qwen35-repro-v6.
+# Defaults to gcr.io/cloud-tpu-multipod-dev/${USER}-runner:qwen35-repro-v7.
 # Run `gcloud auth configure-docker gcr.io -q` once first.
 
 set -euo pipefail
@@ -21,6 +21,7 @@ OVERLAY_FILES=(
   tunix/experimental/orchestrator/algorithm_adapter.py
   tunix/experimental/orchestrator/distributed_rl_engine.py
   tunix/experimental/examples/math_gsm8k_dist/run_gsm8k_dist_grpo.py
+  tunix/experimental/examples/common/run_rollout_node.py
 )
 
 # Build from a context holding only the overlaid files; the repo root is

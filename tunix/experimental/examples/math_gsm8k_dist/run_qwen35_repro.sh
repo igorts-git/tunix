@@ -46,8 +46,8 @@ export PRIORITY_CLASS="${PRIORITY_CLASS:-medium}"
 # ---------------------------------------------------------------------------
 # 2. Images
 # ---------------------------------------------------------------------------
-# Yixuan's e2e image plus a 3-file overlay; build with ../../../../build_qwen35_overlay.sh
-export TUNIX_IMAGE="${TUNIX_IMAGE:-gcr.io/cloud-tpu-multipod-dev/igorts_google_com-runner:qwen35-repro-v6}"
+# Yixuan's e2e image plus a 4-file overlay; build with ../../../../build_qwen35_overlay.sh
+export TUNIX_IMAGE="${TUNIX_IMAGE:-gcr.io/cloud-tpu-multipod-dev/igorts_google_com-runner:qwen35-repro-v7}"
 export PATHWAYS_SERVER_IMAGE="us-docker.pkg.dev/cloud-tpu-v2-images-dev/pathways/gke/datenglin/unsanitized_server:raiden_20260904"
 export PATHWAYS_PROXY_IMAGE="us-docker.pkg.dev/cloud-tpu-v2-images-dev/pathways/gke/datenglin/unsanitized_proxy_server:raiden_20260904"
 # The whole model is staged on the proxy host during Raiden D2H sync; the
@@ -88,18 +88,20 @@ export TRAINER_MESH_EXPERT=1
 # ---------------------------------------------------------------------------
 # 6. Rollout topology: 8 independent 2x2x1 slices, 32 chips, pure TP
 # ---------------------------------------------------------------------------
-# SAMPLER=vllm builds a plain vLLM AsyncEngine, which only understands
-# tensor_parallel_size -- mesh_fsdp is ignored on this path (it is only wired to
-# data_parallel_size by the inprocess_vllm sampler). So all 4 chips of a slice
-# have to be used by TP, and sharding weights FSDP-style over the rollout is
-# off the table anyway: it would reshard on every decode step.
-# TP=4 with base_num_kv_heads=2 makes the converter replicate KV heads to 4;
-# MaxText's loader handles that (kv_heads is in _VLLM_REPEAT_AXES), and the
-# trainer is told via --rollout_mesh_tp so it builds the same shapes.
+# Each slice is 4 chips, filled as TP=2 x DP=2. ROLLOUT_MESH_FSDP is a misnomer
+# on the rollout side: nothing shards weights FSDP-style there, the value is
+# handed to vLLM as data_parallel_size, i.e. whole engine replicas.
+#
+# TP must stay at 2. At TP=4, maxtext_utils replicates base_num_kv_heads 2 -> 4
+# (which MaxText then rejects outright, since the model yml also sets it) and
+# GMM_v2 pads the MoE MLP dim 512 -> 1024 because 512/4 is not a multiple of
+# 2*128. The MoE experts are ~32B of this 35B model, so that padding roughly
+# doubles what the trainer has to hold. At TP=2, 512/2 = 256 is already
+# aligned and num_kv_heads is untouched.
 export ROLLOUT_JOBSET_YAML="jobset.tpu.yaml"
 export ROLLOUT_TPU_SLICE="tpuv5p:2x2x1"
-export ROLLOUT_MESH_FSDP=1
-export ROLLOUT_MESH_TP=4
+export ROLLOUT_MESH_FSDP=2
+export ROLLOUT_MESH_TP=2
 export ROLLOUT_REPLICAS=8
 export SAMPLER="vllm"
 

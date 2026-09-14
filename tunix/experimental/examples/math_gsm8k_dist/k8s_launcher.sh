@@ -129,6 +129,8 @@ export TRAINER_MESH_EXPERT=${TRAINER_MESH_EXPERT:-1}
 
 export PATHWAYS_SERVER_IMAGE=${PATHWAYS_SERVER_IMAGE:-us-docker.pkg.dev/cloud-tpu-v2-images/pathways/server:latest}
 export PATHWAYS_PROXY_IMAGE=${PATHWAYS_PROXY_IMAGE:-us-docker.pkg.dev/cloud-tpu-v2-images/pathways/proxy_server:latest}
+# Empty means "leave it to the yaml generator's default".
+export PATHWAYS_PROXY_MEMORY_LIMIT=${PATHWAYS_PROXY_MEMORY_LIMIT:-}
 
 export ROLLOUT_JOBSET_YAML=${ROLLOUT_JOBSET_YAML:-leaderworkerset.mcjax.ray.yaml}
 export ROLLOUT_TPU_SLICE=${ROLLOUT_TPU_SLICE:-tpuv5e:4x4}
@@ -265,6 +267,7 @@ start_trainer() {
     --cpu_machine=${CPU_MACHINE} \
     --pathways_server_image="${PATHWAYS_SERVER_IMAGE}" \
     --pathways_proxy_server_image="${PATHWAYS_PROXY_IMAGE}" \
+    ${PATHWAYS_PROXY_MEMORY_LIMIT:+--pathways_proxy_memory_limit="${PATHWAYS_PROXY_MEMORY_LIMIT}"} \
     --pathways_gcs_scratch_location=${GCS_SCRATCH_LOCATION} \
     --worker_container_image="${TUNIX_IMAGE}" \
     --worker_container_port="${TRAINER_PORT}" \
@@ -378,6 +381,7 @@ start_rollout_instance() {
     --tpu_slice="${ROLLOUT_TPU_SLICE}" \
     --pathways_server_image="${PATHWAYS_SERVER_IMAGE}" \
     --pathways_proxy_server_image="${PATHWAYS_PROXY_IMAGE}" \
+    ${PATHWAYS_PROXY_MEMORY_LIMIT:+--pathways_proxy_memory_limit="${PATHWAYS_PROXY_MEMORY_LIMIT}"} \
     --pathways_gcs_scratch_location=${GCS_SCRATCH_LOCATION} \
     --worker_container_image="${TUNIX_IMAGE}" \
     --worker_container_port="${ROLLOUT_PORT}" \

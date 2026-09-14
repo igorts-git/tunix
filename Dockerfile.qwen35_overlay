@@ -1,0 +1,39 @@
+# Minimal overlay on top of Yixuan's end-to-end RL image.
+#
+# The base image already carries everything the Qwen3.5-35B-A3B distributed RL
+# run needs (jax 0.11.0 / libtpu 0.0.44 / vllm 0.28.1rc1 with the TPU backend,
+# MaxText under /app/maxtext, the Raiden FFI bridge, and a tunix checkout at
+# /app/tunix that PYTHONPATH=/app makes win over the pip-installed copy).
+#
+# Only three tunix source files are patched here. Everything else -- the
+# launcher, the YAML generator, the Kueue priority label -- runs on the host
+# and needs no image change. Keep this overlay this small: the base image's
+# tunix is a different lineage from github.com/google/tunix HEAD, so copying
+# the whole tree in would silently downgrade Yixuan's fixes.
+#
+#   1. orchestrator/algorithm_adapter.py
+#        strip RLTrainerPayload.metadata before the jitted loss sees it, so the
+#        trainer stops recompiling on every microbatch.
+#   2. orchestrator/distributed_rl_engine.py
+#        fall back to round-robin rollout routing when no prefix_hash is set.
+#   3. examples/math_gsm8k_dist/run_gsm8k_dist_grpo.py
+#        stop setting prefix_hash, which pinned all N generations of a prompt
+#        to a single rollout worker.
+ARG BASE_IMAGE=gcr.io/cloud-tpu-multipod-dev/yixuannwang_google_com-runner:yixuann-e2e-0912head-v8
+FROM ${BASE_IMAGE}
+
+COPY tunix/experimental/orchestrator/algorithm_adapter.py \
+     /app/tunix/experimental/orchestrator/algorithm_adapter.py
+COPY tunix/experimental/orchestrator/distributed_rl_engine.py \
+     /app/tunix/experimental/orchestrator/distributed_rl_engine.py
+COPY tunix/experimental/examples/math_gsm8k_dist/run_gsm8k_dist_grpo.py \
+     /app/tunix/experimental/examples/math_gsm8k_dist/run_gsm8k_dist_grpo.py
+
+# Fail the build rather than the job if a path above ever moves.
+RUN python -c "\
+import tunix.experimental.orchestrator.algorithm_adapter as a, \
+       tunix.experimental.orchestrator.distributed_rl_engine as d; \
+import inspect; \
+assert 'dataclasses.replace(train_example, metadata={})' in inspect.getsource(a), a.__file__; \
+assert 'if route_key is not None else {}' in inspect.getsource(d), d.__file__; \
+print('overlay ok:', a.__file__)"

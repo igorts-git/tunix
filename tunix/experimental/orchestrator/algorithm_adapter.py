@@ -21,6 +21,7 @@ computations directly to `tunix.rl.algo_core`.
 
 import abc
 from collections.abc import Callable, Sequence
+import dataclasses
 import functools
 import types
 from typing import Any
@@ -40,6 +41,16 @@ def _algo_model_input(
     eos_id: int,
 ) -> dict[str, Any]:
   """Maps an RLTrainerPayload microbatch to algorithm loss kwargs."""
+  # RLTrainerPayload is a flax.struct.dataclass, so `metadata` -- a plain dict
+  # whose keys change from microbatch to microbatch -- is static aux_data in the
+  # PyTreeDef. Under jit that makes every microbatch a cache miss and the
+  # trainer recompiles the whole 35B graph on every step. Nothing downstream of
+  # here reads it, so drop it before the jitted loss sees the payload.
+  if (
+      dataclasses.is_dataclass(train_example)
+      and getattr(train_example, "metadata", None)
+  ):
+    train_example = dataclasses.replace(train_example, metadata={})
   return {
       "train_example": train_example,
       "algo_config": algo_config,

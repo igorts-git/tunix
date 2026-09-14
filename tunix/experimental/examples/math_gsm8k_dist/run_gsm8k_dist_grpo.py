@@ -272,7 +272,9 @@ def _build_prompt_item(
           "answer": answer,
           "gold_answer": answer,
           "question": question,
-          "prefix_hash": prompt_id,
+          # No prefix_hash: routing all generations of a prompt to one rollout
+          # worker only pays off with prefix caching on. Without it the
+          # orchestrator should round robin so every worker stays busy.
           "env_config": {
               "prompt": prompt,
               "prompts": prompt,

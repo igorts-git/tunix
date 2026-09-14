@@ -48,21 +48,11 @@ export MAX_SEGMENTS_PER_PACKED_ROW=${MAX_SEGMENTS_PER_PACKED_ROW:-}
 export TRAINER_BACKEND=${TRAINER_BACKEND:-tunix}
 export MINI_BATCH_SIZE=${MINI_BATCH_SIZE:-$((BATCH_SIZE * NUM_GENERATIONS))}
 export EVAL_EVERY_N_STEPS=${EVAL_EVERY_N_STEPS:-1000000}
-export OPT_CHAIN_TYPE=${OPT_CHAIN_TYPE-clip_by_global_norm}
 export MAX_GRAD_NORM=${MAX_GRAD_NORM:-1.0}
 export ADAM_B1=${ADAM_B1:-0.9}
-export ADAM_B2=${ADAM_B2:-0.999}
-export ADAM_EPS=${ADAM_EPS:-1.0e-8}
+export ADAM_B2=${ADAM_B2:-0.99}
 export WEIGHT_DECAY=${WEIGHT_DECAY:-0.01}
 export LEARNING_RATE=${LEARNING_RATE:-2.0e-7}
-# The default is applied with `-` rather than `:-` so that an explicitly empty
-# SCHEDULE_TYPE selects the constant learning rate instead of the default.
-export SCHEDULE_TYPE=${SCHEDULE_TYPE-warmup_cosine_decay_schedule}
-export LR_INIT_VALUE=${LR_INIT_VALUE:-0.0}
-export LR_PEAK_VALUE=${LR_PEAK_VALUE:-$LEARNING_RATE}
-export LR_END_VALUE=${LR_END_VALUE:-0.0}
-export LR_DECAY_STEPS=${LR_DECAY_STEPS:-500}
-export WARMUP_STEPS=${WARMUP_STEPS:-$(((LR_DECAY_STEPS + 9) / 10))}
 export LORA_RANK=${LORA_RANK:-16}
 export LORA_ALPHA=${LORA_ALPHA:-16.0}
 export USE_LORA=${USE_LORA:-0}
@@ -73,11 +63,7 @@ export DEBUG=${DEBUG:-0}
 export SAMPLER=${SAMPLER:-inprocess_vllm}
 export WEIGHT_SYNC_MODE=${WEIGHT_SYNC_MODE:-none}
 export USE_ROLLOUT_LOGPS=${USE_ROLLOUT_LOGPS:-true}
-if [[ "${DISABLE_CHECKPOINTING:-false}" =~ ^(1|true|True|TRUE)$ ]]; then
-  export CHECKPOINT_SAVE_INTERVAL_STEPS=${CHECKPOINT_SAVE_INTERVAL_STEPS:-0}
-else
-  export CHECKPOINT_SAVE_INTERVAL_STEPS=${CHECKPOINT_SAVE_INTERVAL_STEPS:-1}
-fi
+export CHECKPOINT_SAVE_INTERVAL_STEPS=${CHECKPOINT_SAVE_INTERVAL_STEPS:-1}
 export CHECKPOINT_MAX_TO_KEEP=${CHECKPOINT_MAX_TO_KEEP:-10}
 export CHECKPOINT_ROOT_DIRECTORY=${CHECKPOINT_ROOT_DIRECTORY:-checkpoints}
 export ENABLE_PATHWAYS_PERSISTENCE=${ENABLE_PATHWAYS_PERSISTENCE:-0}
@@ -129,8 +115,15 @@ export TRAINER_MESH_EXPERT=${TRAINER_MESH_EXPERT:-1}
 
 export PATHWAYS_SERVER_IMAGE=${PATHWAYS_SERVER_IMAGE:-us-docker.pkg.dev/cloud-tpu-v2-images/pathways/server:latest}
 export PATHWAYS_PROXY_IMAGE=${PATHWAYS_PROXY_IMAGE:-us-docker.pkg.dev/cloud-tpu-v2-images/pathways/proxy_server:latest}
-# Empty means "leave it to the yaml generator's default".
-export PATHWAYS_PROXY_MEMORY_LIMIT=${PATHWAYS_PROXY_MEMORY_LIMIT:-}
+# Host memory ceiling for the pathways-proxy container. The full model is staged
+# on the proxy host during both Raiden D2H weight sync and Orbax checkpoint
+# saves; if those overlap, two full copies must fit. yaml_generator's own default
+# of 100G is below 2x a 35B model and OOM-kills the proxy.
+export PATHWAYS_PROXY_MEMORY_LIMIT=${PATHWAYS_PROXY_MEMORY_LIMIT:-100G}
+# Extra `KEY=VAL` pairs prepended to the trainer's startup command, for ad-hoc
+# diagnostics (e.g. JAX_LOG_COMPILES=1) without rebuilding the image.
+export TRAINER_EXTRA_ENV=${TRAINER_EXTRA_ENV:-}
+
 
 export ROLLOUT_JOBSET_YAML=${ROLLOUT_JOBSET_YAML:-leaderworkerset.mcjax.ray.yaml}
 export ROLLOUT_TPU_SLICE=${ROLLOUT_TPU_SLICE:-tpuv5e:4x4}
@@ -138,8 +131,8 @@ export ROLLOUT_MESH_FSDP=${ROLLOUT_MESH_FSDP:-1}
 export ROLLOUT_MESH_TP=${ROLLOUT_MESH_TP:-16}
 
 # Kubernetes Cluster & Scheduling Options
-export K8S_NAMESPACE=${K8S_NAMESPACE:-${NAMESPACE:-trellis}}
-export KUEUE_QUEUE_NAME=${KUEUE_QUEUE_NAME:-${QUEUE_NAME:-default}}
+export K8S_NAMESPACE=${K8S_NAMESPACE:-${NAMESPACE:-default}}
+export KUEUE_QUEUE_NAME=${KUEUE_QUEUE_NAME:-${QUEUE_NAME:-}}
 export DRY_RUN=${DRY_RUN:-false}
 
 apply_manifest() {
@@ -198,6 +191,7 @@ start_orchestrator() {
         --wandb_run_name=\"${WANDB_RUN_NAME}\" \
         --flush_metrics_every_n_steps=${FLUSH_METRICS_EVERY_N_STEPS} \
         --weight_sync_mode=${WEIGHT_SYNC_MODE} \
+        --checkpoint_save_interval_steps=${CHECKPOINT_SAVE_INTERVAL_STEPS} \
         --stop_workers_on_exit \
         $([[ "${USE_ROLLOUT_LOGPS}" == "false" || "${USE_ROLLOUT_LOGPS}" == "False" || "${USE_ROLLOUT_LOGPS}" == "0" ]] && echo --no-use_rollout_logps || echo --use_rollout_logps) \
         ${MAX_SEQ_TOKEN_PER_TPU:+--max_seq_token_per_tpu=${MAX_SEQ_TOKEN_PER_TPU}} \
@@ -267,12 +261,12 @@ start_trainer() {
     --cpu_machine=${CPU_MACHINE} \
     --pathways_server_image="${PATHWAYS_SERVER_IMAGE}" \
     --pathways_proxy_server_image="${PATHWAYS_PROXY_IMAGE}" \
-    ${PATHWAYS_PROXY_MEMORY_LIMIT:+--pathways_proxy_memory_limit="${PATHWAYS_PROXY_MEMORY_LIMIT}"} \
+    --pathways_proxy_memory_limit="${PATHWAYS_PROXY_MEMORY_LIMIT}" \
     --pathways_gcs_scratch_location=${GCS_SCRATCH_LOCATION} \
     --worker_container_image="${TUNIX_IMAGE}" \
     --worker_container_port="${TRAINER_PORT}" \
     --worker_startup_command=" \
-      ${HF_TOKEN:+HF_TOKEN=\"${HF_TOKEN}\"} ${DISABLE_CHECKPOINTING:+DISABLE_CHECKPOINTING=\"${DISABLE_CHECKPOINTING}\"} VERIFY_WEIGHTS=${VERIFY_WEIGHTS} ENABLE_PATHWAYS_PERSISTENCE=${ENABLE_PATHWAYS_PERSISTENCE}${raiden_env} python -m tunix.experimental.distributed.runtime.main \
+      ${HF_TOKEN:+HF_TOKEN=\"${HF_TOKEN}\"} VERIFY_WEIGHTS=${VERIFY_WEIGHTS} ENABLE_PATHWAYS_PERSISTENCE=${ENABLE_PATHWAYS_PERSISTENCE}${raiden_env}${TRAINER_EXTRA_ENV:+ ${TRAINER_EXTRA_ENV}} python -m tunix.experimental.distributed.runtime.main \
         --discovery_addrs=${ORCHESTRATOR_ID}:${ORCHESTRATOR_PORT} \
         --process_executor=tunix.experimental.distributed.runtime.executor.K8sExecutor \
         --process_main=tunix.experimental.examples.common.run_trainer_node.main \
@@ -290,19 +284,11 @@ start_trainer() {
         --mini_batch_size=${MINI_BATCH_SIZE} \
         --train_micro_batch_size=${TRAIN_MICRO_BATCH_SIZE} \
         --eval_every_n_steps=${EVAL_EVERY_N_STEPS} \
-        --optimizer_opt_chain_type=\"${OPT_CHAIN_TYPE}\" \
-        --optimizer_chain_kwargs=\"{'max_norm': ${MAX_GRAD_NORM}}\" \
-        --optimizer_b1=${ADAM_B1} \
-        --optimizer_b2=${ADAM_B2} \
-        --optimizer_eps=${ADAM_EPS} \
-        --optimizer_weight_decay=${WEIGHT_DECAY} \
-        --optimizer_learning_rate=${LEARNING_RATE} \
-        --optimizer_schedule_type=\"${SCHEDULE_TYPE}\" \
-        --optimizer_init_value=${LR_INIT_VALUE} \
-        --optimizer_peak_value=${LR_PEAK_VALUE} \
-        --optimizer_end_value=${LR_END_VALUE} \
-        --optimizer_warmup_steps=${WARMUP_STEPS} \
-        --optimizer_decay_steps=${LR_DECAY_STEPS} \
+        --max_grad_norm=${MAX_GRAD_NORM} \
+        --adam_b1=${ADAM_B1} \
+        --adam_b2=${ADAM_B2} \
+        --weight_decay=${WEIGHT_DECAY} \
+        --learning_rate=${LEARNING_RATE} \
         --lora_rank=${LORA_RANK} \
         --lora_alpha=${LORA_ALPHA} \
         --checkpoint_save_interval_steps=${CHECKPOINT_SAVE_INTERVAL_STEPS} \
@@ -338,14 +324,13 @@ stop_rollout_instance() {
 }
 
 stop_rollout() {
-  local count="${ROLLOUT_REPLICAS:-1}"
-  if [[ "$count" -lt 16 ]]; then
-    count=16
-  fi
-  for ((i = 0; i < count; i++)); do
-    stop_rollout_instance "${ROLLOUT_ID}-${i}"
+  for ((i = 0; i < ROLLOUT_REPLICAS; i++)); do
+    local target_id="${ROLLOUT_ID}"
+    if [[ $ROLLOUT_REPLICAS -gt 1 ]]; then
+      target_id="${ROLLOUT_ID}-${i}"
+    fi
+    stop_rollout_instance "${target_id}"
   done
-  stop_rollout_instance "${ROLLOUT_ID}"
 }
 
 start_rollout_instance() {
@@ -381,7 +366,6 @@ start_rollout_instance() {
     --tpu_slice="${ROLLOUT_TPU_SLICE}" \
     --pathways_server_image="${PATHWAYS_SERVER_IMAGE}" \
     --pathways_proxy_server_image="${PATHWAYS_PROXY_IMAGE}" \
-    ${PATHWAYS_PROXY_MEMORY_LIMIT:+--pathways_proxy_memory_limit="${PATHWAYS_PROXY_MEMORY_LIMIT}"} \
     --pathways_gcs_scratch_location=${GCS_SCRATCH_LOCATION} \
     --worker_container_image="${TUNIX_IMAGE}" \
     --worker_container_port="${ROLLOUT_PORT}" \
@@ -499,9 +483,6 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ "$DRY_RUN" != "true" ]]; then
-  export PROJECT=${PROJECT:-cloud-tpu-shared-capacity}
-  export CLUSTER=${CLUSTER:-bodaborg-v5p-nap}
-  export LOCATION_NAME=${LOCATION_NAME:-europe-west4}
   ENTER_KUBE_CONTEXT=${ENTER_KUBE_CONTEXT:-"${LAUNCHER_DIR}/../common/enter_kube_context.sh"}
   source "${ENTER_KUBE_CONTEXT}"
 fi

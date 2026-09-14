@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import argparse
-import ast
 import asyncio
 import contextlib
 import logging
@@ -27,6 +26,7 @@ from pathlib import Path
 import pickle
 import signal
 import sys
+import time
 from typing import Any
 
 from flax import nnx
@@ -34,8 +34,8 @@ import jax
 from jax import numpy as jnp
 from jax.experimental import mesh_utils
 from jax.sharding import Mesh
+import optax
 from orbax import checkpoint as ocp
-from tunix.cli import config as cli_config
 from tunix.cli.utils import model as model_utils
 from tunix.experimental.examples.common import models
 from tunix.experimental.train import peft_trainer_v2
@@ -51,58 +51,25 @@ DEFAULT_MODEL_DOWNLOAD_DIR = os.path.join(
 )
 
 
-_OPTIMIZER_ARG_PREFIX = "optimizer_"
-
-
-def _optimizer_config_from_args(args) -> dict[str, Any]:
-  """Collects the `--optimizer_*` flags into a cli optimizer config dict.
-
-  Every flag named `--optimizer_<key>` becomes `<key>` in the returned dict,
-  which mirrors the `optimizer_config` block of `tunix/cli/base_config.yaml`
-  and is the keyword mapping `tunix.cli.config.create_optimizer` consumes:
-  `opt_type` picks the `optax` optimizer, `schedule_type` picks the
-  `optax.schedules` function, and the remaining keys are forwarded to whichever
-  of the two declares them. Keys that neither declares are ignored, and flags
-  left unset are omitted so that the `optax` defaults apply.
-
-  Args:
-    args: Parsed CLI namespace.
-
-  Returns:
-    The optimizer config dict.
-  """
-  return {
-      name.removeprefix(_OPTIMIZER_ARG_PREFIX): value
-      for name, value in vars(args).items()
-      if name.startswith(_OPTIMIZER_ARG_PREFIX) and value is not None
-  }
-
-
 def _build_optimizer(args):
-  """Builds the actor optimizer from the `--optimizer_*` CLI flags.
+  """Builds the actor optimizer from CLI flags.
 
-  Defaults reproduce the previous bare optax.adamw with a constant learning
-  rate (no clipping, optax defaults b2=0.999 / weight_decay=0.0).
+  Defaults reproduce the previous bare optax.adamw (no clipping, optax defaults
+  b2=0.999 / weight_decay=0.0).
 
-  The optimizer is built by `tunix.cli.config.create_optimizer` from the flag
-  dict, so the runner and the YAML driven cli share one implementation:
-  `--optimizer_opt_type` picks the `optax` optimizer and
-  `--optimizer_schedule_type` picks the `optax.schedules` function.
-
-  Gradient clipping is not an optimizer keyword but a separate `optax`
-  transformation, so it is declared by `--optimizer_opt_chain_type` (e.g.
-  `clip_by_global_norm`) and `--optimizer_chain_kwargs` (e.g.
-  `{'max_norm': 1.0}`), which `create_optimizer` chains ahead of the optimizer.
-
-  Args:
-    args: Parsed CLI namespace.
-
-  Returns:
-    The optimizer, preceded by the chained transformation when configured.
+  TODO(tunix-dev): replace these individual flags with a structured actor
+  optimizer config (opt_type / schedule / b1 / b2 / weight_decay /
+  max_grad_norm) matching optimizer creation in cli.
   """
-  return cli_config.create_optimizer(
-      _optimizer_config_from_args(args), "run_trainer_node"
+  adamw = optax.adamw(
+      learning_rate=args.learning_rate,
+      b1=args.adam_b1,
+      b2=args.adam_b2,
+      weight_decay=args.weight_decay,
   )
+  if args.max_grad_norm is not None:
+    return optax.chain(optax.clip_by_global_norm(args.max_grad_norm), adamw)
+  return adamw
 
 
 def _str2bool(v: str | bool) -> bool:
@@ -114,41 +81,6 @@ def _str2bool(v: str | bool) -> bool:
   if v.lower() in ("no", "false", "f", "n", "0"):
     return False
   raise argparse.ArgumentTypeError(f"Boolean value expected, got {v}")
-
-
-def _parse_mapping(v: str | dict[str, Any]) -> dict[str, Any]:
-  """Parses a mapping literal passed on the command line.
-
-  Both JSON (`{"max_norm": 1.0}`) and Python (`{'max_norm': 1.0}`) literals are
-  accepted, because nesting double quotes inside the launcher startup commands
-  requires several levels of shell escaping.
-
-  Args:
-    v: The mapping literal, or an already parsed mapping.
-
-  Returns:
-    The mapping, empty when `v` is empty.
-
-  Raises:
-    argparse.ArgumentTypeError: If `v` is not a mapping literal.
-  """
-  if isinstance(v, dict):
-    return v
-  if not v:
-    return {}
-  try:
-    parsed = ast.literal_eval(v)
-  except (ValueError, SyntaxError) as e:
-    raise argparse.ArgumentTypeError(
-        f"Expected a mapping literal, got {v!r}: {e}"
-    ) from e
-  if not isinstance(parsed, dict):
-    raise argparse.ArgumentTypeError(
-        f"Expected a mapping literal, got {type(parsed).__name__} from {v!r}."
-    )
-  return parsed
-
-
 def _parse_args(argv: list[str]) -> argparse.Namespace:
   """Parses command line arguments for trainer worker process."""
   parser = argparse.ArgumentParser(description="JAX trainer worker process")
@@ -191,132 +123,11 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
   parser.add_argument("--compute_logps_micro_batch_size", type=int, default=1)
   parser.add_argument("--compute_logps_chunk_size", type=int, default=0)
   parser.add_argument("--eval_every_n_steps", type=int, default=1000000)
-  parser.add_argument(
-      "--optimizer_opt_type",
-      type=str,
-      default="adamw",
-      help="Name of the `optax` optimizer to build (e.g. adamw, sgd).",
-  )
-  parser.add_argument(
-      "--optimizer_learning_rate",
-      "--learning_rate",
-      dest="optimizer_learning_rate",
-      type=float,
-      default=2.0e-7,
-      help=(
-          "Constant learning rate. Ignored when --optimizer_schedule_type"
-          " builds a schedule."
-      ),
-  )
-  parser.add_argument(
-      "--optimizer_opt_chain_type",
-      type=str,
-      default=None,
-      help=(
-          "Name of an `optax` gradient transformation chained ahead of the"
-          " optimizer (e.g. clip_by_global_norm). Unset leaves the optimizer"
-          " unchained."
-      ),
-  )
-  parser.add_argument(
-      "--optimizer_chain_kwargs",
-      type=_parse_mapping,
-      default={},
-      help=(
-          "Arguments of --optimizer_opt_chain_type as a mapping literal, e.g."
-          " {'max_norm': 1.0} for clip_by_global_norm."
-      ),
-  )
-  parser.add_argument(
-      "--optimizer_b1",
-      "--adam_b1",
-      dest="optimizer_b1",
-      type=float,
-      default=0.9,
-  )
-  parser.add_argument(
-      "--optimizer_b2",
-      "--adam_b2",
-      dest="optimizer_b2",
-      type=float,
-      default=0.999,
-  )
-  parser.add_argument(
-      "--optimizer_weight_decay",
-      "--weight_decay",
-      dest="optimizer_weight_decay",
-      type=float,
-      default=0.0,
-  )
-  parser.add_argument(
-      "--optimizer_eps",
-      "--adam_eps",
-      dest="optimizer_eps",
-      type=float,
-      default=1e-8,
-      help="AdamW epsilon.",
-  )
-  parser.add_argument(
-      "--optimizer_schedule_type",
-      "--schedule_type",
-      dest="optimizer_schedule_type",
-      type=str,
-      default="",
-      help=(
-          "Name of an `optax.schedules` function used to build the actor LR"
-          " (e.g. constant_schedule, warmup_cosine_decay_schedule). Empty"
-          " keeps the constant --optimizer_learning_rate. Only applies to"
-          " --trainer_backend=tunix; the maxtext backend builds its own"
-          " optimizer."
-      ),
-  )
-  parser.add_argument(
-      "--optimizer_value",
-      dest="optimizer_value",
-      type=float,
-      default=None,
-      help="Learning rate of constant_schedule.",
-  )
-  parser.add_argument(
-      "--optimizer_init_value",
-      dest="optimizer_init_value",
-      type=float,
-      default=None,
-      help="Learning rate the warmup starts from.",
-  )
-  parser.add_argument(
-      "--optimizer_peak_value",
-      dest="optimizer_peak_value",
-      type=float,
-      default=None,
-      help="Learning rate the warmup ends at, where the decay starts.",
-  )
-  parser.add_argument(
-      "--optimizer_end_value",
-      dest="optimizer_end_value",
-      type=float,
-      default=None,
-      help="Learning rate the decay ends at.",
-  )
-  parser.add_argument(
-      "--optimizer_warmup_steps",
-      "--warmup_steps",
-      dest="optimizer_warmup_steps",
-      type=int,
-      default=None,
-      help="Steps to warm up from init_value to peak_value over.",
-  )
-  parser.add_argument(
-      "--optimizer_decay_steps",
-      "--lr_decay_steps",
-      dest="optimizer_decay_steps",
-      type=int,
-      default=None,
-      help=(
-          "Total steps of the schedule, warmup included, after which the"
-          " learning rate stays at end_value."
-      ),
-  )
+  parser.add_argument("--learning_rate", type=float, default=2.0e-7)
+  parser.add_argument("--max_grad_norm", type=float, default=None)
+  parser.add_argument("--adam_b1", type=float, default=0.9)
+  parser.add_argument("--adam_b2", type=float, default=0.999)
+  parser.add_argument("--weight_decay", type=float, default=0.0)
   parser.add_argument("--use_lora", action="store_true")
   parser.add_argument("--lora_rank", type=int, default=64)
   parser.add_argument("--lora_alpha", type=float, default=64.0)
@@ -514,9 +325,23 @@ def _load_actor_model(args, mesh: Mesh, *, lora: bool):
 class _MeshBoundTrainer:
   """Binds generic PeftTrainer v2 calls to this worker's JAX mesh."""
 
-  def __init__(self, trainer: peft_trainer_v2.PeftTrainer, mesh: Mesh):
+  def __init__(
+      self,
+      trainer: peft_trainer_v2.PeftTrainer,
+      mesh: Mesh,
+      save_enabled: bool = True,
+  ):
     self._trainer = trainer
     self._mesh = mesh
+    # False when checkpoint_save_interval_steps=0. The backends disagree on how
+    # to express "never save" -- the MaxText engine only honours
+    # enable_checkpointing, which must stay on to restore the base weights --
+    # so the decision is made once here and applied uniformly.
+    self._save_enabled = save_enabled
+    # Step of the most recent checkpoint this wrapper wrote, so close() can
+    # tell "the orchestrator already saved this exact step" from "the last
+    # step is unsaved". None until the first save.
+    self._last_saved_train_step: int | None = None
 
   def __getattr__(self, name: str) -> Any:
     return getattr(self._trainer, name)
@@ -525,8 +350,26 @@ class _MeshBoundTrainer:
     with self._mesh:
       self._trainer.fwd_bwd(*args, **kwargs)
 
+  def _clear_resumed_mid_step(self) -> None:
+    """Defuses the engine's forced save on the step a run resumes into.
+
+    `MaxTextTrainingEngine.update()` calls `save_checkpoint(..., force=True)`
+    when `_resumed_mid_step` is set, bypassing `save_checkpoint` on this wrapper
+    entirely. Clearing the flag first is the only way to honour "never save"
+    on that path. It cannot fire on a fresh run, only when resuming from a
+    partial checkpoint.
+    """
+    if getattr(self._trainer, "_resumed_mid_step", False):
+      logging.info(
+          "checkpoint saving disabled; clearing _resumed_mid_step so the"
+          " engine does not force a checkpoint on the resumed step."
+      )
+      self._trainer._resumed_mid_step = False  # pylint: disable=protected-access
+
   def update(self, **kwargs) -> int:
     with self._mesh:
+      if not self._save_enabled:
+        self._clear_resumed_mid_step()
       return self._trainer.update(**kwargs)
 
   def eval_step(self, *args, **kwargs) -> None:
@@ -543,20 +386,119 @@ class _MeshBoundTrainer:
     with self._mesh:
       self._trainer.compile(*args, **kwargs)
 
+  def _drain_inflight_checkpoint(self) -> None:
+    """Blocks until any in-flight checkpoint write has finished.
+
+    Orbax saves asynchronously, so `save_checkpoint()` returns while the model
+    is still being staged to host memory. Raiden's weight sync stages the whole
+    model to that same host, and two concurrent copies of a 35B model
+    (2 x 64.6 GiB) OOM-killed the Pathways proxy. Draining at the start of the
+    sync is the one choke point that enforces this regardless of which path
+    started the save -- the orchestrator's request, `close()`, or the
+    resumed-mid-step forced save.
+    """
+    manager = getattr(self._trainer, "_checkpoint_manager", None)
+    wait = getattr(manager, "wait_until_finished", None)
+    if wait is None:
+      return
+    start = time.monotonic()
+    wait()
+    waited = time.monotonic() - start
+    if waited > 1.0:
+      logging.info(
+          "Waited %.1fs for an in-flight checkpoint save to finish before"
+          " starting the weight sync.",
+          waited,
+      )
+
   def prepare_weight_sync(self, **kwargs) -> Any:
     with self._mesh:
+      self._drain_inflight_checkpoint()
       return self._trainer.prepare_weight_sync(**kwargs)
 
   def save_checkpoint(self, metadata: Any = None, **kwargs) -> None:
+    # Defence in depth. The orchestrator now honours
+    # checkpoint_save_interval_steps itself, but it is a separate process and
+    # can be launched with a different value, so a trainer told "never save"
+    # refuses the write rather than trusting the caller.
+    if not self._save_enabled:
+      logging.info(
+          "checkpoint_save_interval_steps=0; skipping the orchestrator's save"
+          " request instead of writing a full-size checkpoint."
+      )
+      return
     with self._mesh:
       self._trainer.save_checkpoint(metadata, **kwargs)
+      # Read back after the call: the engine derives the step it actually wrote
+      # from its own counter, so this is the only value guaranteed to match.
+      self._last_saved_train_step = getattr(self._trainer, "train_step", None)
 
   def restore_checkpoint(self, **kwargs) -> Any:
     with self._mesh:
       return self._trainer.restore_checkpoint(**kwargs)
 
+  def _suppress_final_checkpoint(self, reason: str) -> None:
+    """Stops the backend writing a final checkpoint from `close()`.
+
+    `MaxTextTrainingEngine.close()` calls `save_checkpoint(..., force=True)`
+    whenever `enable_checkpointing` is set -- and that flag has to stay set,
+    because the same flag also gates *restoring* the base weights (see
+    `maxtext_utils.build_maxtext_config`). Saving and loading are not separable
+    through the config, so the manager is dropped instead: that skips only the
+    final-save branch, while Raiden teardown and metrics cleanup in `close()`
+    still run.
+
+    Args:
+      reason: Why the final save is being suppressed, for the log line.
+    """
+    manager = getattr(self._trainer, "_checkpoint_manager", None)
+    if manager is None:
+      # The PeftTrainer backend has no such attribute and does not save from
+      # close(); log rather than fail so the difference stays visible.
+      logging.info(
+          "%s exposes no _checkpoint_manager; nothing to suppress at close().",
+          type(self._trainer).__name__,
+      )
+      return
+    # A checkpoint the orchestrator asked for is still being written out
+    # asynchronously at this point. Drop the manager only once it has landed,
+    # or the checkpoint we are keeping would be the truncated one.
+    self._drain_inflight_checkpoint()
+    logging.info(
+        "%s dropping the checkpoint manager so %s.close() does not write a"
+        " final full-size checkpoint.",
+        reason,
+        type(self._trainer).__name__,
+    )
+    try:
+      manager.close()
+    except Exception:  # pylint: disable=broad-except
+      logging.exception("Ignoring error while closing the checkpoint manager.")
+    self._trainer._checkpoint_manager = None  # pylint: disable=protected-access
+
+  def _final_checkpoint_would_duplicate(self) -> bool:
+    """True when `close()` would rewrite the step we have already saved.
+
+    `close()` calls `save_checkpoint(metadata=None, force=True)` with no step,
+    and the engine then derives one from its own counter -- which, when the
+    orchestrator's interval divides the step count, is the step it just saved.
+    `force=True` bypasses Orbax's interval policy, so nothing downstream
+    deduplicates it: without this check the last step of every run is written
+    twice, at full size.
+    """
+    if self._last_saved_train_step is None:
+      return False
+    current = getattr(self._trainer, "train_step", None)
+    return current is not None and current == self._last_saved_train_step
+
   def close(self) -> None:
     with self._mesh:
+      if not self._save_enabled:
+        self._suppress_final_checkpoint("checkpoint_save_interval_steps=0;")
+      elif self._final_checkpoint_would_duplicate():
+        self._suppress_final_checkpoint(
+            f"step {self._last_saved_train_step} is already checkpointed;"
+        )
       self._trainer.close()
 
 
@@ -594,13 +536,6 @@ def _create_maxtext_trainer_factory(args) -> Any:
   grad_accumulation_steps = max(
       1, math.ceil(args.mini_batch_size / args.train_micro_batch_size)
   )
-  if args.optimizer_schedule_type:
-    logging.warning(
-        "--optimizer_schedule_type=%s is ignored by the maxtext backend, which"
-        " builds its own optimizer from --optimizer_learning_rate and"
-        " --maxtext_warmup_steps_fraction.",
-        args.optimizer_schedule_type,
-    )
   extra_cfg_kwargs = {}
   import inspect  # pylint: disable=g-import-not-at-top
   sig = inspect.signature(maxtext_utils.build_maxtext_config)
@@ -622,7 +557,7 @@ def _create_maxtext_trainer_factory(args) -> Any:
       num_devices=jax.device_count(),
       max_prompt_length=args.max_prompt_length,
       max_response_length=args.max_response_length,
-      learning_rate=args.optimizer_learning_rate,
+      learning_rate=args.learning_rate,
       warmup_steps_fraction=args.maxtext_warmup_steps_fraction,
       load_parameters_path=args.maxtext_ckpt_path,
       padded_moe_mlp_dim=args.maxtext_padded_moe_mlp_dim,
@@ -642,7 +577,9 @@ def _create_maxtext_trainer_factory(args) -> Any:
         tokenizer_pad_id=pad_id,
         wrap_with_tunix_adapter=True,
     )
-    return _MeshBoundTrainer(engine, mesh)
+    return _MeshBoundTrainer(
+        engine, mesh, save_enabled=args.checkpoint_save_interval_steps > 0
+    )
 
   return _factory
 
@@ -716,7 +653,9 @@ def _create_tunix_trainer_factory(args) -> Any:
           training_config,
           sampler_type=args.sampler_type,
       )
-    return _MeshBoundTrainer(trainer, mesh)
+    return _MeshBoundTrainer(
+        trainer, mesh, save_enabled=args.checkpoint_save_interval_steps > 0
+    )
 
   return _factory
 
@@ -756,11 +695,8 @@ def main(argv: list[str], context: Any = None) -> None:
     raise ValueError("--mini_batch_size must be positive.")
   if args.num_generations <= 0:
     raise ValueError("--num_generations must be positive.")
-  if args.optimizer_chain_kwargs and not args.optimizer_opt_chain_type:
-    raise ValueError(
-        "--optimizer_chain_kwargs is only used by"
-        " --optimizer_opt_chain_type, which is not set."
-    )
+  if args.max_grad_norm is not None and args.max_grad_norm <= 0:
+    raise ValueError("--max_grad_norm must be positive when specified.")
 
   logging.info("Creating generic TrainerWorker and gRPC server...")
   trainer_factory = _create_trainer_factory(args)

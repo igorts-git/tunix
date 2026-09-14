@@ -21,6 +21,13 @@ import os
 from typing import Any
 
 
+# MaxText gates checkpoint *loading* and *saving* on the same `enable_checkpointing`
+# flag, so "never save, but still restore" cannot be expressed by turning the flag
+# off. It is expressed instead by leaving the flag on and pushing `checkpoint_period`
+# beyond any realistic run length.
+_NEVER_SAVE_CHECKPOINT_PERIOD = 1_000_000_000
+
+
 def maxtext_modules():
   """Imports MaxText lazily; some installs nest it under maxtext.src.maxtext."""
   from maxtext.configs import pyconfig  # pylint: disable=g-import-not-at-top
@@ -269,16 +276,28 @@ def build_maxtext_config(
         f"max_num_checkpoints_to_keep={checkpointing_options.max_to_keep}",
     ])
   elif checkpointing_options is not None:
-    logging.info(
-        "checkpoint save_interval_steps=0; disabling checkpoint saving "
-        "(load_parameters_path still restores)."
-    )
     if load_parameters_path:
-      # MaxText config validation requires enable_checkpointing=True when
-      # load_parameters_path is set. We initialize with True and disable saving
-      # via config._flat_config post-initialization.
-      argv.append("enable_checkpointing=True")
+      # `enable_checkpointing=False` would also disable *restoring*: MaxText
+      # validates `(load_parameters_path or load_full_state_path) and not
+      # enable_checkpointing` and raises "You must set enable_checkpointing=True
+      # to load a checkpoint" (maxtext/configs/types.py). Keep it enabled so the
+      # base weights still load, and suppress saving via the period instead.
+      # Saving is separately prevented by the trainer's read-only Orbax manager.
+      logging.info(
+          "checkpoint save_interval_steps=0 with load_parameters_path set; "
+          "keeping enable_checkpointing=True (required to restore) and "
+          "setting checkpoint_period=%d so no checkpoint is ever written.",
+          _NEVER_SAVE_CHECKPOINT_PERIOD,
+      )
+      argv.extend([
+          "enable_checkpointing=True",
+          f"checkpoint_period={_NEVER_SAVE_CHECKPOINT_PERIOD}",
+      ])
     else:
+      logging.info(
+          "checkpoint save_interval_steps=0 and nothing to restore; "
+          "disabling checkpointing entirely."
+      )
       argv.append("enable_checkpointing=False")
   elif load_parameters_path:
     argv.append("enable_checkpointing=True")
@@ -344,21 +363,7 @@ def build_maxtext_config(
     ])
 
   logging.info("MaxText config argv: %s", argv)
-  config = pyconfig.initialize(argv)
-
-  # When save_interval_steps=0 or DISABLE_CHECKPOINTING is set, disable checkpoint saving
-  # post-initialization. MaxText requires enable_checkpointing=True at initialization time
-  # when load_parameters_path is set to restore weights.
-  if (
-      checkpointing_options is not None and save_interval_steps == 0
-  ) or os.environ.get("DISABLE_CHECKPOINTING", "").lower() in (
-      "1",
-      "true",
-      "yes",
-  ):
-    config._flat_config["enable_checkpointing"] = False  # pylint: disable=protected-access
-
-  return config
+  return pyconfig.initialize(argv)
 
 
 def create_maxtext_mesh(maxtext_config: Any) -> Any:

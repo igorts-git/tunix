@@ -138,6 +138,17 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
       ),
   )
   parser.add_argument(
+      "--checkpoint_save_interval_steps",
+      type=int,
+      default=1,
+      help=(
+          "Save a checkpoint every N full-batch boundaries; 0 disables saving. "
+          "The orchestrator is what issues save requests, so this has to be "
+          "set here -- the trainer node's flag of the same name only governs "
+          "how the Orbax manager is built."
+      ),
+  )
+  parser.add_argument(
       "--rollout_replicas",
       type=int,
       default=1,
@@ -230,6 +241,11 @@ def _build_algo(args: argparse.Namespace) -> algorithm_adapter.GRPOAdapter:
   return algorithm_adapter.GRPOAdapter(
       algo_config=algo_config,
       mini_batch_size=args.batch_size,
+      # Without this the adapter keeps its default of 1, and rl_program reads
+      # that back via getattr(algo, "train_micro_batch_size", 1). The flag was
+      # validated and logged but never applied, so every trainer pass saw a
+      # batch of 1 -- which also fails to divide the fsdp mesh axis, making
+      # each pass replicate instead of shard.
       train_micro_batch_size=args.train_micro_batch_size,
       max_packed_len=(
           args.max_seq_token_per_tpu
@@ -256,6 +272,7 @@ def _build_prompt_item(
           "answer": answer,
           "gold_answer": answer,
           "question": question,
+          "prefix_hash": prompt_id,
           "env_config": {
               "prompt": prompt,
               "prompts": prompt,
@@ -426,6 +443,7 @@ def main(argv: list[str], context: ProcessContext | None = None) -> None:
       metrics_logging_options=metrics_logging_options,
       max_staleness=args.max_staleness,
       sync_weights=(args.weight_sync_mode != "none"),
+      checkpoint_save_interval_steps=args.checkpoint_save_interval_steps,
       on_step_begin=lambda step: logging.info(
           ">>> Step %d starting | Policy Version: %d",
           step,

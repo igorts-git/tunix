@@ -46,8 +46,9 @@ export PRIORITY_CLASS="${PRIORITY_CLASS:-medium}"
 # ---------------------------------------------------------------------------
 # 2. Images
 # ---------------------------------------------------------------------------
-# Yixuan's e2e image plus a 4-file overlay; build with ../../../../build_qwen35_overlay.sh
-export TUNIX_IMAGE="${TUNIX_IMAGE:-gcr.io/cloud-tpu-multipod-dev/igorts_google_com-runner:qwen35-repro-v7}"
+# Yixuan's e2e image plus an 8-file overlay (7 tunix + 1 maxtext); build with
+# ../../../../build_qwen35_overlay.sh
+export TUNIX_IMAGE="${TUNIX_IMAGE:-gcr.io/cloud-tpu-multipod-dev/igorts_google_com-runner:qwen35-repro-v11}"
 export PATHWAYS_SERVER_IMAGE="us-docker.pkg.dev/cloud-tpu-v2-images-dev/pathways/gke/datenglin/unsanitized_server:raiden_20260904"
 export PATHWAYS_PROXY_IMAGE="us-docker.pkg.dev/cloud-tpu-v2-images-dev/pathways/gke/datenglin/unsanitized_proxy_server:raiden_20260904"
 # The whole model is staged on the proxy host during Raiden D2H sync; the
@@ -80,8 +81,17 @@ export ENABLE_PATHWAYS_PERSISTENCE=0
 # 5. Trainer topology: one Pathways 2x2x2 slice, 8 chips, pure FSDP
 # ---------------------------------------------------------------------------
 export TRAINER_JOBSET_YAML="jobset.pathways.yaml"
-export TRAINER_TPU_SLICE="tpuv5p:2x2x2"
-export TRAINER_MESH_FSDP=8
+# Scaling the trainer is about weight sync, not about training throughput.
+# Measured at 8 chips: a 393s step is 233s weight sync + ~150s rollout + only a
+# few seconds of actual gradient work, so more chips buy nothing on the compute
+# side. They only help if Raiden's D2H egress parallelizes across trainer hosts
+# (v5p packs 4 chips per host, so 2x2x2 = 2 hosts and 2x2x4 = 4).
+#
+# TRAINER_MESH_FSDP must equal the chip count, and TRAIN_MICRO_BATCH_SIZE must
+# be a multiple of it (maxtext_utils raises otherwise), so the three move
+# together: 2x2x2/8/8, 2x2x4/16/16, 2x4x4/32/32.
+export TRAINER_TPU_SLICE="${TRAINER_TPU_SLICE:-tpuv5p:2x2x2}"
+export TRAINER_MESH_FSDP="${TRAINER_MESH_FSDP:-8}"
 export TRAINER_MESH_TP=1
 export TRAINER_MESH_EXPERT=1
 
@@ -103,15 +113,32 @@ export ROLLOUT_TPU_SLICE="tpuv5p:2x2x1"
 export ROLLOUT_MESH_FSDP=2
 export ROLLOUT_MESH_TP=2
 export ROLLOUT_REPLICAS=8
-export SAMPLER="vllm"
+# Must be inprocess_vllm. On the plain "vllm" path the Raiden destination
+# registry is never populated with MaxText-named variables, so weight sync dies
+# in preflight before step 0 with all 633 source variables unmatched
+# ("source variable 'decoder.decoder_norm.scale' has no destination
+# counterpart"). inprocess_vllm logs "Using local registration for destination
+# metadata" and matches all 633. Same image, same mesh, same everything else.
+export SAMPLER="${SAMPLER:-inprocess_vllm}"
 
 # ---------------------------------------------------------------------------
 # 7. Weight synchronization
 # ---------------------------------------------------------------------------
 export WEIGHT_SYNC_MODE="raiden"
-export USE_WEIGHT_CONVERTER=true
-export PREFUSE_MOE_WEIGHTS=true
-export VERIFY_WEIGHTS=false
+export USE_WEIGHT_CONVERTER="${USE_WEIGHT_CONVERTER:-true}"
+# Set on *both* sides, so the two stay consistent either way. true is the
+# intended setting (it is what the rollout's GMM kernel wants); false is kept
+# reachable because the MoE interleave is the leading suspect for §6.1 --
+# _interleave_moe_weights is a pure permutation/reshape, which is exactly the
+# class of bug that preserves the abs-sum checksums we verified while still
+# destroying the model.
+export PREFUSE_MOE_WEIGHTS="${PREFUSE_MOE_WEIGHTS:-true}"
+# Deliberately overridable. VERIFY_WEIGHTS=true makes the Raiden delegate log
+# destination checksums and transfer metrics after each h2d, which is the only
+# handle we have on the garbage-generation blocker (see report v6 §6.1). A
+# hardcoded `false` here silently swallows `VERIFY_WEIGHTS=true
+# ./run_qwen35_repro.sh start` -- k8s_launcher.sh reads it long after this line.
+export VERIFY_WEIGHTS="${VERIFY_WEIGHTS:-false}"
 # Off: prompts in a GRPO batch share no prefix worth caching, and with it off we
 # are free to round robin generations across rollout workers.
 export ENABLE_PREFIX_CACHING=false
@@ -125,17 +152,33 @@ export NUM_GENERATIONS="${NUM_GENERATIONS:-16}"
 # One optimizer update per step over all BATCH_SIZE*NUM_GENERATIONS rollouts.
 export MINI_BATCH_SIZE=$((BATCH_SIZE * NUM_GENERATIONS))
 export MAX_PROMPT_LENGTH=512
-export MAX_RESPONSE_LENGTH=512
+# This budget is harsher than it looks, and it is implicated in reward being
+# pinned at exactly 0. A trajectory that spends the whole budget in one turn is
+# marked MAX_CONTEXT_LIMIT_REACHED, and trajectory_collect_engine.collect then
+# skips _append_final_reward entirely -- so it scores a hard 0.0 no matter what
+# the model wrote, rather than being graded and merely losing the format points.
+# At 512 that was 27 of ~30 trajectories on rollout worker 0, which is why both
+# reward_mean and reward_std were 0.0000: almost nothing was being graded at all.
+# The prompt asks for "detailed step-by-step reasoning", so the budget has to
+# cover the reasoning block *and* the closing tags with room to spare.
+export MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-1024}"
 # Sequence packing. The packed row count per microbatch is
-# trainer_fsdp * trainer_dp = 8, and TRAIN_MICRO_BATCH_SIZE has to match that so
-# MaxText gets per_device_batch_size = 8/8 = 1.
-export TRAIN_MICRO_BATCH_SIZE=8
-# Budget per packed row. It cannot exceed MaxText's max_target_length, which
-# maxtext_utils fixes at max_prompt_length + max_response_length -- so 1024 is
-# the ceiling, not a tuning choice. Packing still pays: a GSM8K prompt plus
-# answer is ~250-350 tokens, so ~3 trajectories share each row and the trainer
-# does roughly a third as many forward/backward passes as with padding.
-export MAX_SEQ_TOKEN_PER_TPU=1024
+# trainer_fsdp * trainer_dp, and TRAIN_MICRO_BATCH_SIZE has to match it so
+# MaxText gets per_device_batch_size = 1.
+export TRAIN_MICRO_BATCH_SIZE="${TRAIN_MICRO_BATCH_SIZE:-${TRAINER_MESH_FSDP}}"
+# Budget per packed row, and MaxText's max_target_length (the overlay makes the
+# trainer take the larger of this and max_prompt+max_response).
+#
+# Left at the floor, packing is a no-op by construction: validate_packing_budget
+# demands budget >= max_prompt+max_response, and stock maxtext_utils pins
+# max_target_length to that same sum, so a row holds exactly one maximal
+# trajectory. Measured that way: ~1.14 trajectories per row.
+#
+# At 4096 the same step packed 61/55/57/48/35 trajectories per microbatch
+# (~7.6 per row), collapsing a step from 32 microbatches to 5. Note that this
+# bought only ~4s of a 393s step -- gradient work was never the bottleneck --
+# but it is strictly better and costs nothing.
+export MAX_SEQ_TOKEN_PER_TPU="${MAX_SEQ_TOKEN_PER_TPU:-4096}"
 export USE_ROLLOUT_LOGPS=true
 
 # ---------------------------------------------------------------------------

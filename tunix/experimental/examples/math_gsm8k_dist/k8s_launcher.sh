@@ -87,6 +87,13 @@ export ENABLE_PREFIX_CACHING=${ENABLE_PREFIX_CACHING:-false}
 # rollout sides during weight sync, for cross-verification of a real run.
 export VERIFY_WEIGHTS=${VERIFY_WEIGHTS:-false}
 
+# Rollout-side generation diagnostics, both rate-limited to the first N per
+# worker. TUNIX_LOG_GENERATIONS logs every raw generation, including the ones
+# that exhaust the response budget and are therefore dropped before env.step;
+# GSM8K_LOG_COMPLETIONS logs only the scored ones, with their reward breakdown.
+export TUNIX_LOG_GENERATIONS=${TUNIX_LOG_GENERATIONS:-0}
+export GSM8K_LOG_COMPLETIONS=${GSM8K_LOG_COMPLETIONS:-3}
+
 export WANDB_PROJECT=${WANDB_PROJECT:-trellis-gsm8k}
 export WANDB_RUN_NAME=${WANDB_RUN_NAME:-}
 export WANDB_API_KEY=${WANDB_API_KEY:-}
@@ -167,6 +174,7 @@ start_orchestrator() {
   "$PYTHON" "$YAML_GEN" \
     "$YAML_DIR/jobset.cpu.yaml" \
     --jobset_name="${ORCHESTRATOR_ID}" \
+    --max_restarts="${ORCHESTRATOR_MAX_RESTARTS:-0}" \
     --namespace="${K8S_NAMESPACE}" \
     ${KUEUE_QUEUE_NAME:+--queue_name="${KUEUE_QUEUE_NAME}"} \
     ${KUEUE_PRIORITY_CLASS:+--priority_class="${KUEUE_PRIORITY_CLASS}"} \
@@ -237,6 +245,9 @@ start_trainer() {
         exit 1
       fi
     fi
+    # prefuse_moe_weights has to match on both sides. The rollout block below
+    # passes it; without it here the trainer argparse-defaults to False and the
+    # two ends of the weight sync disagree about the MoE variable layout.
     extra_flags+=" \
       --maxtext_model_name=${MAXTEXT_MODEL_NAME} \
       ${TRAINER_PADDED_MOE_MLP_DIM:+--maxtext_padded_moe_mlp_dim=${TRAINER_PADDED_MOE_MLP_DIM}} \
@@ -246,6 +257,8 @@ start_trainer() {
       --mesh_expert=${TRAINER_MESH_EXPERT} \
       ${ROLLOUT_MESH_TP:+--rollout_mesh_tp=${ROLLOUT_MESH_TP}} \
       --use_weight_converter=${USE_WEIGHT_CONVERTER} \
+      --prefuse_moe_weights=${PREFUSE_MOE_WEIGHTS} \
+      ${MAX_SEQ_TOKEN_PER_TPU:+--max_seq_token_per_tpu=${MAX_SEQ_TOKEN_PER_TPU}} \
     "
   fi
 
@@ -376,7 +389,7 @@ start_rollout_instance() {
     --worker_container_image="${TUNIX_IMAGE}" \
     --worker_container_port="${ROLLOUT_PORT}" \
     --worker_startup_command=" \
-      ${HF_TOKEN:+HF_TOKEN=\"${HF_TOKEN}\"} SKIP_JAX_PRECOMPILE=1 VERIFY_WEIGHTS=${VERIFY_WEIGHTS}${raiden_env} ${ROLLOUT_USE_BATCHED_RPA:+USE_BATCHED_RPA_KERNEL=1} python -m tunix.experimental.distributed.runtime.main \
+      ${HF_TOKEN:+HF_TOKEN=\"${HF_TOKEN}\"} SKIP_JAX_PRECOMPILE=1 VERIFY_WEIGHTS=${VERIFY_WEIGHTS} TUNIX_LOG_GENERATIONS=${TUNIX_LOG_GENERATIONS} GSM8K_LOG_COMPLETIONS=${GSM8K_LOG_COMPLETIONS}${raiden_env} ${ROLLOUT_USE_BATCHED_RPA:+USE_BATCHED_RPA_KERNEL=1} python -m tunix.experimental.distributed.runtime.main \
         --discovery_addrs=${ORCHESTRATOR_ID}:${ORCHESTRATOR_PORT} \
         --process_executor=tunix.experimental.distributed.runtime.executor.K8sExecutor \
         --process_main=tunix.experimental.examples.common.run_rollout_node.main \

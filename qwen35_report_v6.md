@@ -251,6 +251,285 @@ match the rollout).
 
 ## 6. Open issues
 
+### 6.0 SOLVED: `prefuse_moe_weights` must *differ* between trainer and rollout
+
+**The reward-0 blocker is fixed.** One line in `k8s_launcher.sh`: the trainer
+must run `--prefuse_moe_weights=false` while the rollout runs `true`. No image
+change, no code change, no MaxText patch.
+
+Before (both `true`), completions were 10–58 characters of digit soup and
+`reward_mean` was exactly 0 on every step of every run. After
+(`TRAINER_PREFUSE_MOE_WEIGHTS=false`), the first three logged completions of
+step 0:
+
+```
+[gsm8k] completion 1/3: chars=824 reward=1.00 format_ok=True answer_ok=True extracted='13' gold='13' closes_reasoning=True
+  tail='...Total Time = 2 + 6 + 5\n\nCalculation:\n2 + 6 = 8\n8 + 5 = 13\n\nSo, the total time spent waiting is 13 minutes.\n</reasoning>\n<answer>\\boxed{13}</answer><|im_end|>'
+[gsm8k] completion 2/3: chars=802 reward=1.00 format_ok=True answer_ok=True extracted='13' gold='13' closes_reasoning=True
+[gsm8k] completion 3/3: chars=730 reward=1.00 format_ok=True answer_ok=True extracted='7'  gold='7'  closes_reasoning=True
+```
+
+Correct arithmetic, correct `<reasoning>`/`<answer>` format, correct gold
+answer, clean `<|im_end|>` stop. Full VTC reward 1.00.
+
+Trainer-side confirmation that the flag landed:
+
+```
+[TrainerNode] MaxText param base.decoder.layers.layer_0.mlp.routed_experts.wi_0 shape=(256, 10, 2048, 512)
+[TrainerNode] Trainer prepared weight sync for step 0: registered 1 work unit(s) with 633 variables
+```
+
+`wi_0` present with the unfused last dim 512 (not the fused 1024), and the
+converter still hands the rollout its 633 fused variables.
+
+Note for anyone grepping: the `[gsm8k] completion` lines are emitted on the
+**rollout** pods, not the orchestrator.
+
+The rest of this section is the derivation and the two wrong turns taken along
+the way; §6.0.3 has the mechanism.
+
+#### 6.0.0 Why this was hard to see
+
+Every diagnostic available pointed away from the real cause:
+
+- Raiden's weight-sync verification passed **633/633 tensors** with matching
+  element counts. Its `checksums()` are per-tensor float32 **abs-sums**, which
+  are invariant under permutation — and the corruption is exactly a
+  permutation.
+- Both ends independently compute the same `moe_mlp_tp_size=2`
+  (`adapter.py:139`), so every shard-count check came back clean.
+- The trainer demonstrably held the real checkpoint (`decoder_norm.scale`
+  abs-sum 3232.55 over `(2048,)` = mean 1.578, not the 1.0 of a fresh
+  ones-init).
+- The one config the launcher forced to agree on both ends is the one that had
+  to disagree, and it was forced under a comment asserting the opposite.
+
+The two 4-chip experiments below also pointed in opposite directions; both are
+recorded because one of them nearly sent me the wrong way.
+
+#### 6.0.1 The 4-chip harness does NOT reproduce the blocker — its generation runs on dummy weights
+
+`run_qwen35_validate_converter.sh` (§6.5) does produce digit soup:
+
+```
+Generation test after weight transfer:
+['aros制备方法aros.vxarosarosabeearosabeeabeearos…inado зреcalararosabee зре vestiaros…']
+validate_converter completed successfully
+EXIT_CODE=0
+```
+
+but it is an artifact, and I nearly drew the wrong conclusion from it. Three
+runs using **three different sync paths** —
+
+| run | path taken | output |
+|---|---|---|
+| `TRAINER_PREFUSE=true` | `Qwen35MaxTextToVLLMConverter` | soup |
+| `TRAINER_PREFUSE=false ROLLOUT_PREFUSE=true` | `Qwen35MaxTextToVLLMConverter` | **byte-identical** soup |
+| `USE_CONVERTER=false` | `legacy tunix sync` (`transfer_state_directly`, `converter=None`) | **byte-identical** soup |
+
+— produced the *same 300 tokens*. Three independent conversion implementations
+cannot corrupt weights identically. The corroborating numbers were in the log
+all along and I read past them:
+
+```
+[weight-sync] sampler.update_params via <any of the three>
+              (convert+reshard+assign): 0.37 s | HBM in_use 57.95 GiB (delta +0.00) | peak 57.95 GiB
+ASSIGNMENT COMPLETE: synced 785 weight leaves via sampler.update_params
+```
+
+0.37 s and **+0.00 GiB** for a 35B convert+reshard+assign. `sampler.update_params()`
+writes into a state object the running vLLM model does not read, so generation
+falls back to vLLM's `load_format: 'dummy'` weights — deterministic at `seed=0`,
+hence bit-identical across arms.
+
+**Retracted:** the claim that this localizes the blocker to a single process and
+kills the cross-mesh hypotheses. It does not. Nothing about the distributed path
+is eliminated. §6.5's harness needs `sampler.update_params` to actually land
+before any of its generations mean anything; until then only its
+`debug_converter=true` arm (which calls `converter.convert()` directly, see
+§6.0.2) is trustworthy.
+
+#### 6.0.2 …but the debug arm proved the prefuse premise outright
+
+`DEBUG_CONVERTER=true` bypasses `update_params` and calls
+`converter.convert(model_state, …)` directly at `validate_converter.py:950`.
+With `TRAINER_PREFUSE=true` it dies immediately:
+
+```
+[rank0]:   File ".../torchax_converter/qwen35_moe.py", line 258, in _convert_moe
+[rank0]:     wi_0 = jnp.transpose(routed["wi_0"], (1, 0, 2, 3))
+[rank0]:   File ".../flax/nnx/statelib.py", line 258, in __getitem__
+[rank0]: KeyError: 'wi_0'
+```
+
+**There is no `wi_0` in the trainer's `model_state`.** `prefuse_moe_weights=true`
+really does fuse the trainer model, which is the premise §6.0.3 rests on and
+which the null A/B had made me doubt. (My earlier inference — "it didn't
+`KeyError`, so the source must be unfused" — was wrong for the non-debug runs
+for the reason in §6.0.1: those never reached the converter's MoE code at all.)
+
+So the two arms say: the trainer *is* fused when told to be, and the harness's
+generation can't see it either way.
+
+Worth recording as an elimination: that converter's interleave
+
+```python
+w1_chunks = wi_0.reshape(num_reps, num_experts, d_model, tp_size, chunk_size)
+w3_chunks = wi_1.reshape(...)
+combined_shards = jnp.stack([w1_chunks, w3_chunks], axis=-2)   # (…, tp, 2, chunk)
+gate_up = combined_shards.reshape(num_reps, num_experts, d_model, -1)
+```
+
+produces exactly `[g_s0|u_s0|g_s1|u_s1]` at `tp_size = 2` — the same layout
+`_interleave_moe_weights(lane_size=0)` produces, and the same layout `gmm_v2`
+wants. **Two independently written converters agree on the MoE layout**, which
+weakens the MoE-interleave family of hypotheses considerably.
+
+#### 6.0.2b The harness does not exercise production's converter
+
+An important caveat discovered while reading the null result, and a gap worth
+reporting upstream:
+
+```
+[weight-sync] sampler.update_params via Qwen35MaxTextToVLLMConverter (convert+reshard+assign)
+```
+
+Production's trainer builds `WeightConverter` directly
+(`maxtext_engine.py:649-668`). The harness got `Qwen35MaxTextToVLLMConverter`
+instead, despite `direct_maxtext_sync=True, use_weight_converter=True` — the
+combination `validate_converter.py:889` documents as "mode 1 new
+(`WeightConverter(rules=None)`)". The reason is
+`maxtext_vllm_rollout.py:56-64`:
+
+```python
+def _rule_table_for(model_name: str):
+  if model_name == "qwen3-0.6b":
+    return MODEL_TO_CONVERSION_RULES["qwen3"]
+  return _NO_RULE_TABLE
+```
+
+Only `qwen3-0.6b` clears the `rule_table is not _NO_RULE_TABLE` guard at line
+99, so for **every** other model — including all of qwen3.5 — the
+`WeightConverter` returns at lines 103/111 are unreachable and control falls
+through to the per-model torchax converter at line 116. So
+`_create_model_converter` can never return a `WeightConverter` for
+qwen3.5-35b-a3b, and `validate_converter`'s documented mode-1-new arm is not
+selectable for this model.
+
+Consequence: the harness reproduces the *symptom* but through a sibling
+conversion path. That two independent converters both yield soup is itself
+informative, but the harness cannot yet A/B production's own converter.
+
+#### 6.0.3 The prefuse hypothesis, as argued from the code
+
+Still worth stating, because the code reading stands on its own and the
+launcher was in fact misconfigured relative to the flags' documented defaults.
+
+**`prefuse_moe_weights` names two incompatible layouts, and the launcher was
+setting both ends to the same value.**
+
+The fused MoE kernel `wi` has last dim `2 × padded_moe_mlp_dim` = 1024. Which
+half is gate and which is up depends on who reads it:
+
+| end | attention | who reads `wi` | layout it assumes |
+|---|---|---|---|
+| trainer | `dot_product` (default) | `moe.py:3692`: `n = wi.shape[-1]//2; w0 = wi[..., :n]; w1 = wi[..., n:]` | **global** concat `[gate \| up]` |
+| rollout | `vllm_rpa` (`configs/inference/vllm.yml:15`) | `moe.py:3690` → `tpu_inference.fused_moe_func` → tokamax `gmm_v2`, `rhs_up_ref = rhs[..., out_size_n:]` on the **local shard** | **per-shard** concat `[g_s0\|u_s0\|g_s1\|u_s1]` |
+
+At TP=1 these coincide. At the rollout's `moe_mlp_tp_size=2` they do not.
+
+Three code facts close the loop:
+
+1. **The trainer builds the global layout at checkpoint load.**
+   `model_creation_utils.py:221 _fuse_moe_weights` fuses the checkpoint's
+   `wi_0`/`wi_1` into the model's `wi`, taking `n_shards` from *the trainer's
+   own* sharding of `wi`'s last axis (lines 270-275). The validator log shows
+   that spec as `P(None, None, 'fsdp', None)` — last axis unsharded — so
+   **`n_shards = 1`**, i.e. plain global concat. Correct for the trainer; wrong
+   for a TP=2 destination.
+
+2. **The converter's per-shard interleave only runs on an *unfused* source.**
+   `convert_utils.py:149`:
+   ```python
+   if not src_key or src_key[-1] != "wi_0":
+     continue
+   ```
+   With `prefuse_moe_weights=true` on the trainer there is no `wi_0` in the
+   source tree — only `wi` — so `_fuse_moe_bulk` / `_interleave_moe_weights`
+   are skipped entirely and `wi` is copied **verbatim**. All the machinery for
+   getting `n_shards` right (`resolve_rollout_tp`, `moe_mlp_tp_size`, the
+   `_get_n_shards` fallback) is dead code on this path. That is why every
+   attempt to fix `n_shards` in §6.1 found it already correct: the code that
+   uses it was never reached.
+
+3. **The defaults already encode the right answer; the launcher overrode them.**
+   `run_trainer_node.py:212` → `default=False`, help text *"Off for the
+   trainer."*; `run_rollout_node.py:218` → `default=True`. But
+   `k8s_launcher.sh` passed the single env `PREFUSE_MOE_WEIGHTS` (default
+   `true`) to **both** — line 264 (trainer) and line 410 (rollout) — under a
+   comment asserting they had to match. `recipes/trellis_gsm8k_qwen3p5_35b.sh:46`
+   sets the same global `true`, so this is upstream, not something introduced
+   here.
+
+**The resulting corruption is exactly the observed symptom.** `wi` is
+`(256, 10, 2048, 1024)` = global `[gate(512) | up(512)]`, sharded 2-way on the
+last axis: shard 0 receives all 512 gate columns, shard 1 all 512 up columns.
+`gmm_v2` on shard 0 then computes `act(gate[:256]) * gate[256:]` and on shard 1
+`act(up[:256]) * up[256:]`. Every expert MLP is garbage — but it is a pure
+**permutation of the same elements**, so Raiden's per-tensor float32 abs-sums
+match 633/633 with identical element counts, and the "transport is faithful"
+evidence that blocked §6.1 for two sessions is simply measuring the wrong
+thing. Fluent-looking digit soup from a coherent attention stack with broken
+MLPs is the expected output.
+
+It also explains, in retrospect, the failed `noprefuse` A/B in §6.4: that run
+set `PREFUSE_MOE_WEIGHTS=false` on *both*, so the rollout went to 673 unfused
+variables while the converter — which forces `prefuse=True` for its own plan
+(`resolve_prefuse_moe_weights`, §6.4a) — produced a fused `wi`, giving
+`preflight: source variable '...routed_experts.wi' has no destination
+counterpart`. The §6.4a dead-code path is *benign* for the fixed configuration:
+the converter should always fuse. Only the trainer's model config needs to be
+false.
+
+**The fix (config only, no image change, no code change):**
+
+```
+TRAINER_PREFUSE_MOE_WEIGHTS=false   # trainer keeps wi_0/wi_1
+PREFUSE_MOE_WEIGHTS=true            # rollout wants fused wi  (unchanged)
+```
+
+`k8s_launcher.sh` now has the two as separate variables with those defaults, so
+the recipe needs no change. With the trainer unfused, the converter's
+`_fuse_moe_bulk` runs, `n_shards` resolves to `self.tp = 2` via
+`rollout_tensor_parallelism=2`, and `_interleave_moe_weights(lane_size=0)`
+emits the per-shard concat the kernel wants — which matches the
+independently-computed `moe_mlp_tp_size=2` the destination reports at
+`adapter.py:139`.
+
+**Confirmation status: CONFIRMED end-to-end** on the real 40-chip topology —
+see the completions at the top of §6.0. The `KeyError: 'wi_0'` of §6.0.2
+establishes the one step that was in doubt — the trainer really is fused under
+`prefuse_moe_weights=true`. The rest of the chain is code reading, now backed
+by the end-to-end result:
+
+- fused trainer ⇒ `convert_utils.py:149` (`src_key[-1] != "wi_0" → continue`)
+  skips the fuse ⇒ `wi` copied verbatim. Corroborated negatively: neither
+  4-chip run logged the `"Fusing MoE %s: wi_0=%s, wi_1=%s -> %s on axis %d"`
+  line from `convert_utils.py:175`.
+- destination wants per-shard at 2 shards — agreed on independently by
+  `gmm_v2`, by `adapter.py:139` (`moe_mlp_tp_size=2`), and by
+  `qwen35_moe.py:271-283`.
+
+The end-to-end effect could not be measured in the 4-chip harness — it cannot
+generate meaningfully (§6.0.1) and cannot reach `WeightConverter` for this model
+(§6.0.2b) — so it was measured on the real topology: a 2-step run with
+`TRAINER_PREFUSE_MOE_WEIGHTS=false`. Result at the top of §6.0.
+
+The change also aligns the launcher with the flags' own documented defaults
+(`run_trainer_node.py:212` → `default=False`, *"Off for the trainer."*;
+`run_rollout_node.py:218` → `default=True`), which the single shared env had
+been overriding.
+
 ### 6.1 BLOCKER: reward is pinned at exactly 0
 
 `reward_mean = 0.0000`, `std = 0.0000` on every step of every run so far
@@ -358,34 +637,105 @@ Ruled out:
   `routed_experts.rngs.params.count` and `.key` — RNG state, correctly excluded.
 - **Not the base checkpoint.** The trainer restores it cleanly
   (`[sync] Finished load in 95.96 seconds`), and its own source checksums look
-  like trained weights, not init (e.g. `decoder_norm.scale` mean ≈ 0.79, not 1.0).
+  like trained weights, not init. `decoder_norm.scale` has abs-sum 3232.55 over
+  a `(2048,)` tensor (`base_emb_dim=2048`, confirmed by the trainer's own
+  `wi_0 shape=(256, 10, 2048, 512)` log), i.e. mean 1.578. A freshly
+  initialised RMSNorm scale is exactly ones, which would sum to exactly
+  2048.0. The trainer is demonstrably holding the real checkpoint.
 - **Not response length, not the prompt, not the chat parser**, per above.
 - **Not caused by anything in this overlay** — v4 showed the same zero reward.
 
+#### Why source-vs-destination comparison cannot solve this
+
+Worth stating plainly, because it cost me a diagnostic run. The checksums are
+taken on the trainer *after* conversion and on the rollout *after* receipt. The
+conversion is upstream of both. So no comparison between the two sides — not
+abs-sums, not a permutation-sensitive element-order hash, not a full bit
+compare — can tell you whether the converted arrangement is the one the rollout
+kernel actually wants. A perfect match only proves the transport is faithful,
+and we already know it is. Answering the real question needs **ground truth**:
+convert the weights and then *generate*, and read the text.
+
+That is what `run_qwen35_validate_converter.sh` (new, §6.5) does, on 4 chips.
+
+#### What the MoE layout is actually required to be
+
+I traced this end to end rather than guessing, because the fuse is the leading
+suspect and it is parameterised by a shard count that is derived, not passed.
+
+- The rollout serves MaxText through vLLM, which layers
+  `maxtext/configs/inference/vllm.yml` on top — that is where `attention:
+  "vllm_rpa"` comes from. The rollout node does **not** set it
+  (`maxtext_attention=''` in its parsed args).
+- Under `vllm_rpa` + `prefuse_moe_weights=true`, `moe.py:3690` hands `self.wi`
+  to `tpu_inference`'s `fused_moe_func` **untouched** — it does not take the
+  `wi[..., :n] / wi[..., n:]` split at `moe.py:3692`. So the required layout is
+  the kernel's, not MaxText's.
+- The kernel is tokamax `gmm_v2`. With `fuse_act` set it does
+  `rhs_up_ref = rhs[..., out_size_n:]` where `out_size_n = size_n // 2`, on the
+  **local shard's** rhs, and then lane-interleaves gate/up into VMEM itself
+  (`FusedWeightsRef.get_weight() -> interleave_lane(...)`).
+
+So each TP shard must receive a plain `[local_gate | local_up]`, i.e. exactly
+what `_interleave_moe_weights` produces with `lane_size=0` and
+`n_shards == the destination's shard count on the fused axis`. Pre-interleaving
+in HBM would double-interleave.
+
+The destination's shard count: `moe.py:602` sets the MoE kernel's TP axes to
+`("model", "attn_dp")` under `vllm_rpa`. The rollout log reports
+`ShardingStrategy(tensor_parallelism=2, ..., attention_data_parallelism=1)` over
+4 devices, so the fused axis is split **2** ways.
+
+**The converter arrives at 2, but by luck.** In `WeightConverter.__init__`:
+
+```python
+self.tp           = resolve_rollout_tp(config, tp)
+self.kv_tp_size   = kv_tp_size   or getattr(config, "kv_tp_size", 1)   or self.tp
+self.moe_mlp_tp_size = moe_mlp_tp_size or getattr(config, "moe_mlp_tp_size", 1) or self.tp
+```
+
+MaxText defaults both `kv_tp_size` and `moe_mlp_tp_size` to **1**, which is
+truthy, so the `or self.tp` fallback is unreachable — and nothing ever sets
+them, see §6.4. Hence the trainer's log line `kv_tp_size=1, moe_mlp_tp_size=1`.
+For the MoE the code then falls through to `self.tp`:
+
+```python
+n_shards = (self.moe_mlp_tp_size if self.moe_mlp_tp_size > 1
+            else (self.tp if self.tp > 1 else _get_n_shards(wi_0, scan_fused_axis)))
+```
+
+and `self.tp` *does* resolve to 2, via `rollout_tensor_parallelism=2`. So
+`n_shards=2`, which matches. But note the last fallback: with no rollout TP
+configured at all, this reads the shard count off the **trainer's** sharding of
+`wi_0`, which on an FSDP=8/TP=1 mesh is 1 — silently producing a global
+`[all_gate | all_up]` concat. Anyone reproducing this on a different topology
+must keep `ROLLOUT_MESH_TP` set.
+
 Remaining hypotheses, now narrowed to layout:
 
-1. **MoE interleave.** `_interleave_moe_weights` (`tunix/generate/utils.py:1229`)
-   is a pure reshape/permute parameterised by `n_shards` and `lane_size` — the
-   exact class of transform that preserves an abs-sum while destroying the
-   model. The MoE experts are ~32B of this 35B model. **Being tested now**
-   (`RUN_TAG=noprefuse`, `PREFUSE_MOE_WEIGHTS=false` on both sides).
+1. **MoE interleave.** Still open, but weakened: the required layout and the
+   produced layout both work out to per-shard concat with `n_shards=2`, per the
+   trace above. What is *not* yet verified is that the rollout's MaxText state
+   really shards `wi`'s fused axis 2 ways and not 4 (`data_parallelism=2` also
+   appears in its sharding config). The MoE experts are ~32B of this 35B model,
+   so this stays first on the list until a generation test clears it.
 2. **Cross-mesh shard mapping.** The trainer is FSDP=8 over 2 hosts; each rollout
    is `data:2 × model:2` with `num_shards=4`. Raiden pairs tensors by name and
    ships shards; if the 8-way source sharding is mapped onto the 4-way
    destination incorrectly, every device gets the wrong slice and the global
-   abs-sum is still exactly preserved. This fits the evidence just as well as
-   (1) and is *not* excluded by the `noprefuse` test.
+   abs-sum is still exactly preserved.
 3. **Hybrid Gated-DeltaNet tensors.** 30 of 40 layers are GDN (`A_log`,
-   `dt_bias`, `conv1d.kernel`, `in_proj_qkvz`, `in_proj_ba`) — unusual tensors
-   with packed layouts, and a wrong unpacking of `in_proj_qkvz` would corrupt
-   three-quarters of the network exactly as observed.
+   `dt_bias`, `conv1d.kernel`, `in_proj_qkvz`, `in_proj_ba`) — packed layouts
+   whose wrong unpacking would corrupt three-quarters of the network exactly as
+   observed. Argument *against*: both ends are MaxText and the converter copies
+   these by name with no restructuring, so the two sides should agree by
+   construction. The MoE is special precisely because the trainer stores
+   `wi_0`/`wi_1` separately and the rollout wants one kernel-shaped `wi`.
 
-Note (1) and (2) are both *layout* faults and both consistent with everything
-measured; the checksum test cannot separate them. Separating them needs
-element-order verification, not sum verification — e.g. a per-tensor hash of the
-first N elements in canonical order, compared across the two sides. That is the
-diagnostic I would add next, and it is a small change to
-`RaidenSynchronizer.checksums()`.
+The `validate_converter` harness in §6.5 discriminates (1)+(2) from (3) in one
+4-chip run: it converts and generates in a single process with no Raiden and no
+cross-mesh transfer, so coherent text there localises the fault to the
+distributed transport, and garbage there localises it to the conversion.
 
 Two practical notes for whoever picks this up:
 
@@ -438,6 +788,87 @@ not pod status.**
 **Benign but misleading:** `No checkpoint found, skipping restore.` is the tunix
 RL-resume probe against the empty run directory. Base weights load fine —
 look for `[sync] Finished load in 95.96 seconds @ gs://hengtaoguo-maxtext-logs/...`.
+
+### 6.4 Two config flags that silently never reach the converter
+
+Both found while trying to run the `PREFUSE_MOE_WEIGHTS=false` A/B. Neither is
+fixed here — flagging first, per the standing instruction.
+
+**(a) `prefuse_moe_weights=false` cannot be expressed on the trainer.**
+`convert_utils.resolve_prefuse_moe_weights` is:
+
+```python
+if prefuse_moe_weights is not None:            return bool(prefuse_moe_weights)   # caller passes None
+if "ROLLOUT_PREFUSE_MOE_WEIGHTS" in os.environ: return ...
+if getattr(config, "rollout_prefuse_moe_weights", None) is not None: return ...   # field does not exist
+rollout_backend = ... or "maxtext"
+if rollout_backend == "maxtext":               return True        # <-- our path, unconditional
+if getattr(config, "prefuse_moe_weights", None) is not None:  return bool(...)    # dead code
+```
+
+The `config.prefuse_moe_weights` check sits *below* the unconditional
+`return True`, and `rollout_prefuse_moe_weights` is not a MaxText config field
+at all. So on the MaxText rollout backend the flag is pinned to True no matter
+what the config says. Observed directly:
+
+```
+[TrainerNode] Config param prefuse_moe_weights: False
+[TrainerNode] MaxTextToMaxTextConverter: ... moe_fused_layout=per_shard_interleave, prefuse_moe=True, ...
+[TrainerNode] MaxText param base.decoder.layers.layer_0.mlp.routed_experts.wi_0 shape=(256, 10, 2048, 512)
+```
+
+The rollout *did* honour the flag (`bind prepared 673 arrays` instead of 633),
+so the two ends disagreed and the run died at preflight:
+
+```
+WeightSyncError: round 0 ... manifest preflight failed before any destination was quiesced;
+no rollback needed (120 problems, first: preflight: source variable
+'decoder.layers.0.mlp.routed_experts.wi' has no destination counterpart)
+```
+
+**So the `noprefuse` A/B did not test anything** — it failed before a single
+weight moved, and the MoE-interleave hypothesis is untested, not refuted. The
+only working lever today is the env var `ROLLOUT_PREFUSE_MOE_WEIGHTS=false` on
+the trainer pod. The fix upstream is to move the `config.prefuse_moe_weights`
+check above the `rollout_backend == "maxtext"` default.
+
+**(b) `kv_tp_size` / `moe_mlp_tp_size` never reach the MaxText config.**
+`tunix/utils/maxtext_utils.build_maxtext_config` derives both from
+`rollout_mesh_tp` (lines 128–140) but the argv it emits contains only
+`rollout_tensor_parallelism=`; neither `kv_tp_size=` nor `moe_mlp_tp_size=` is
+ever appended. MaxText then uses its defaults of 1, and because
+`WeightConverter.__init__` writes `kv_tp_size or getattr(config,"kv_tp_size",1)
+or self.tp` — with 1 being truthy — the `or self.tp` fallback is dead. Result:
+`kv_tp_size=1, moe_mlp_tp_size=1` in the converter's log even though
+`--rollout_mesh_tp=2` was passed.
+
+The MoE path survives this by falling through to `self.tp` (see §6.1). The KV
+path does not: `kv_replication = kv_tp_size // base_num_kv_heads` is computed
+from the wrong number. Here it happens to be harmless — `base_num_kv_heads=2`
+and rollout TP=2 means one KV head per shard and no replication is needed — but
+it would be wrong on any topology where TP exceeds the KV head count.
+
+### 6.5 New: a 4-chip ground-truth harness
+
+`tunix/experimental/examples/math_gsm8k_dist/run_qwen35_validate_converter.sh`
+(host-side only, no image change) wraps
+`maxtext.integration.vllm.validate_converter` as a single-slice JobSet:
+
+```
+./run_qwen35_validate_converter.sh start | logs | stop | yaml
+```
+
+It loads the real Orbax checkpoint into MaxText, converts with the *same*
+`WeightConverter` production uses (via `MaxTextVllmSampler.update_params`),
+assigns into vLLM, and generates greedily (`temperature=0.0`) from a GSM8K
+prompt. `rollout_tensor_parallelism=2` and `prefuse_moe_weights=true` mirror
+production. One v5p `2x2x1` slice, no Raiden, no orchestrator, no trainer /
+rollout mesh split — about 4 chips for ~15 minutes against 40 chips for ~25.
+
+Useful knobs: `USE_CONVERTER=false` runs the legacy tunix
+`transfer_state_directly` instead, for A/B; `DEBUG_CONVERTER=true` stops after
+the key-coverage and weight-stat checks without generating; `ROLLOUT_TP` and
+`PREFUSE` vary the two suspect parameters.
 
 ---
 

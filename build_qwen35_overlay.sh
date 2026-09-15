@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Builds and pushes the 8-file overlay image used by the Qwen3.5-35B-A3B RL run.
+# Builds and pushes the 9-file overlay image used by the Qwen3.5-35B-A3B RL run.
 #
 #   ./build_qwen35_overlay.sh [image-tag]
 #
-# Seven files come from this tunix checkout and one from the maxtext checkout
+# Eight files come from this tunix checkout and one from the maxtext checkout
 # alongside it (override with MAXTEXT_DIR).
 #
-# Defaults to gcr.io/cloud-tpu-multipod-dev/${USER}-runner:qwen35-repro-v11.
+# Defaults to gcr.io/cloud-tpu-multipod-dev/${USER}-runner:qwen35-repro-v12.
 # Run `gcloud auth configure-docker gcr.io -q` once first.
 
 set -euo pipefail
@@ -15,7 +15,7 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # The overlay spans two checkouts: tunix (this repo) and maxtext.
 MAXTEXT_DIR="${MAXTEXT_DIR:-${REPO_DIR}/../maxtext}"
 BASE_IMAGE="${BASE_IMAGE:-gcr.io/cloud-tpu-multipod-dev/yixuannwang_google_com-runner:yixuann-e2e-0912head-v8}"
-IMAGE="${1:-gcr.io/cloud-tpu-multipod-dev/${USER}-runner:qwen35-repro-v11}"
+IMAGE="${1:-gcr.io/cloud-tpu-multipod-dev/${USER}-runner:qwen35-repro-v12}"
 
 DOCKER=(docker)
 if ! docker info &>/dev/null; then
@@ -30,6 +30,7 @@ TUNIX_FILES=(
   tunix/utils/maxtext_utils.py
   tunix/experimental/examples/common/run_trainer_node.py
   tunix/rl/agentic/trajectory/trajectory_collect_engine.py
+  tunix/experimental/orchestrator/rl_program.py
 )
 # Paths relative to MAXTEXT_DIR; staged under maxtext/ in the build context.
 MAXTEXT_FILES=(

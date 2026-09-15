@@ -79,7 +79,11 @@ export ROLLOUT_USE_BATCHED_RPA=${ROLLOUT_USE_BATCHED_RPA:-}
 export ROLLOUT_MAXTEXT_ATTENTION=${ROLLOUT_MAXTEXT_ATTENTION:-}
 
 # MoE & Weight Sync Flags
+# PREFUSE_MOE_WEIGHTS is the ROLLOUT's setting. The trainer's is separate and
+# defaults false -- the two ends are not supposed to agree. See the comment on
+# the trainer's --prefuse_moe_weights below.
 export PREFUSE_MOE_WEIGHTS=${PREFUSE_MOE_WEIGHTS:-true}
+export TRAINER_PREFUSE_MOE_WEIGHTS=${TRAINER_PREFUSE_MOE_WEIGHTS:-false}
 export USE_WEIGHT_CONVERTER=${USE_WEIGHT_CONVERTER:-true}
 export ENABLE_PREFIX_CACHING=${ENABLE_PREFIX_CACHING:-false}
 
@@ -97,6 +101,15 @@ export GSM8K_LOG_COMPLETIONS=${GSM8K_LOG_COMPLETIONS:-3}
 export WANDB_PROJECT=${WANDB_PROJECT:-trellis-gsm8k}
 export WANDB_RUN_NAME=${WANDB_RUN_NAME:-}
 export WANDB_API_KEY=${WANDB_API_KEY:-}
+# Required, not optional. metrax's WandbBackend calls wandb.init() with only
+# project/name (metrax/logging/wandb_backend.py:58), and wandb refuses to start
+# a run when the key's viewer has no defaultEntity -- which this one does not.
+# tunix swallows that as `logging.info("WandbBackend skipped: %s", e)`
+# (sft/metrics_logger.py:199), so the run proceeds with W&B silently off and
+# the only trace is one INFO line in the orchestrator log. wandb.init() reads
+# WANDB_ENTITY from the environment, so this is a host-side fix needing no
+# image rebuild.
+export WANDB_ENTITY=${WANDB_ENTITY:-google-trellis}
 export TFDS_DATA_DIR=${TFDS_DATA_DIR:-"artifacts/data"}
 export TFDS_SPLIT=${TFDS_SPLIT:-train}
 export FLUSH_METRICS_EVERY_N_STEPS=${FLUSH_METRICS_EVERY_N_STEPS:-1}
@@ -186,6 +199,7 @@ start_orchestrator() {
       ${WANDB_API_KEY:+WANDB_API_KEY=\"${WANDB_API_KEY}\"} \
       WANDB_PROJECT=\"${WANDB_PROJECT}\" \
       WANDB_RUN_NAME=\"${WANDB_RUN_NAME}\" \
+      ${WANDB_ENTITY:+WANDB_ENTITY=\"${WANDB_ENTITY}\"} \
       python -m tunix.experimental.distributed.runtime.main \
         --discovery_id=${ORCHESTRATOR_ID} \
         --discovery_port=${ORCHESTRATOR_PORT} \
@@ -245,9 +259,25 @@ start_trainer() {
         exit 1
       fi
     fi
-    # prefuse_moe_weights has to match on both sides. The rollout block below
-    # passes it; without it here the trainer argparse-defaults to False and the
-    # two ends of the weight sync disagree about the MoE variable layout.
+    # prefuse_moe_weights must NOT match the rollout's -- the flag means two
+    # different layouts on the two ends:
+    #
+    #   trainer (attention != vllm_rpa): moe.py:3692 reads `wi` as a *global*
+    #     concat, w0 = wi[..., :n] / w1 = wi[..., n:]. _fuse_moe_weights in
+    #     model_creation_utils.py:221 builds that at checkpoint load using
+    #     n_shards from the trainer's own sharding of wi's last axis -- under
+    #     FSDP that axis is unsharded, so n_shards=1.
+    #   rollout (attention == vllm_rpa): `wi` goes whole into fused_moe_func ->
+    #     tokamax gmm_v2, which splits the *local* shard at its midpoint, i.e.
+    #     at TP=2 it wants [gate_s0|up_s0|gate_s1|up_s1].
+    #
+    # The converter bridges the two, but only when the source still holds
+    # wi_0/wi_1: convert_utils.py:149 skips the fuse for an already-fused
+    # source. So the trainer stays unfused and the converter interleaves for
+    # the destination's shard count. Setting both true copies the trainer's
+    # global-concat `wi` verbatim, giving shard 0 all-gate and shard 1 all-up
+    # -- a permutation, so Raiden's abs-sum checksums still match 633/633 and
+    # the rollout emits fluent garbage. That was the reward=0 blocker.
     extra_flags+=" \
       --maxtext_model_name=${MAXTEXT_MODEL_NAME} \
       ${TRAINER_PADDED_MOE_MLP_DIM:+--maxtext_padded_moe_mlp_dim=${TRAINER_PADDED_MOE_MLP_DIM}} \
@@ -257,7 +287,7 @@ start_trainer() {
       --mesh_expert=${TRAINER_MESH_EXPERT} \
       ${ROLLOUT_MESH_TP:+--rollout_mesh_tp=${ROLLOUT_MESH_TP}} \
       --use_weight_converter=${USE_WEIGHT_CONVERTER} \
-      --prefuse_moe_weights=${PREFUSE_MOE_WEIGHTS} \
+      --prefuse_moe_weights=${TRAINER_PREFUSE_MOE_WEIGHTS} \
       ${MAX_SEQ_TOKEN_PER_TPU:+--max_seq_token_per_tpu=${MAX_SEQ_TOKEN_PER_TPU}} \
     "
   fi

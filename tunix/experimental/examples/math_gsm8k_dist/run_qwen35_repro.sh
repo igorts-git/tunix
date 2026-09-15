@@ -46,9 +46,9 @@ export PRIORITY_CLASS="${PRIORITY_CLASS:-medium}"
 # ---------------------------------------------------------------------------
 # 2. Images
 # ---------------------------------------------------------------------------
-# Yixuan's e2e image plus an 8-file overlay (7 tunix + 1 maxtext); build with
+# Yixuan's e2e image plus a 9-file overlay (8 tunix + 1 maxtext); build with
 # ../../../../build_qwen35_overlay.sh
-export TUNIX_IMAGE="${TUNIX_IMAGE:-gcr.io/cloud-tpu-multipod-dev/igorts_google_com-runner:qwen35-repro-v11}"
+export TUNIX_IMAGE="${TUNIX_IMAGE:-gcr.io/cloud-tpu-multipod-dev/igorts_google_com-runner:qwen35-repro-v12}"
 export PATHWAYS_SERVER_IMAGE="us-docker.pkg.dev/cloud-tpu-v2-images-dev/pathways/gke/datenglin/unsanitized_server:raiden_20260904"
 export PATHWAYS_PROXY_IMAGE="us-docker.pkg.dev/cloud-tpu-v2-images-dev/pathways/gke/datenglin/unsanitized_proxy_server:raiden_20260904"
 # The whole model is staged on the proxy host during Raiden D2H sync; the
@@ -126,13 +126,16 @@ export SAMPLER="${SAMPLER:-inprocess_vllm}"
 # ---------------------------------------------------------------------------
 export WEIGHT_SYNC_MODE="raiden"
 export USE_WEIGHT_CONVERTER="${USE_WEIGHT_CONVERTER:-true}"
-# Set on *both* sides, so the two stay consistent either way. true is the
-# intended setting (it is what the rollout's GMM kernel wants); false is kept
-# reachable because the MoE interleave is the leading suspect for §6.1 --
-# _interleave_moe_weights is a pure permutation/reshape, which is exactly the
-# class of bug that preserves the abs-sum checksums we verified while still
-# destroying the model.
+# This is the ROLLOUT's setting only. The trainer's is a separate variable
+# (TRAINER_PREFUSE_MOE_WEIGHTS, defaulted false in k8s_launcher.sh) and the two
+# are NOT supposed to agree -- `prefuse_moe_weights` means a different layout on
+# each end. See the long comment in k8s_launcher.sh and report v6 §6.0.
+# Setting both true is what pinned reward at 0: the trainer's global-concat
+# `wi` was copied verbatim, so at rollout TP=2 shard 0 got all-gate and shard 1
+# all-up. That is a pure permutation, hence invisible to Raiden's abs-sum
+# checksums.
 export PREFUSE_MOE_WEIGHTS="${PREFUSE_MOE_WEIGHTS:-true}"
+export TRAINER_PREFUSE_MOE_WEIGHTS="${TRAINER_PREFUSE_MOE_WEIGHTS:-false}"
 # Deliberately overridable. VERIFY_WEIGHTS=true makes the Raiden delegate log
 # destination checksums and transfer metrics after each h2d, which is the only
 # handle we have on the garbage-generation blocker (see report v6 §6.1). A

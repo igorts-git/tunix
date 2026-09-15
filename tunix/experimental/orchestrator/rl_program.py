@@ -48,7 +48,16 @@ def _extract_reward(item: Any) -> float:
     return 0.0
   traj = getattr(item, "traj", item)
   if isinstance(traj, dict):
-    return float(traj.get("reward", 0.0))
+    # TrajectoryCollectEngine.collect() emits the episode reward under
+    # "trajectory_reward" in Token mode (trajectory_collect_engine.py:337),
+    # which is the mode the distributed rollout path uses; "reward" is the
+    # per-step key from Steps mode. Reading only "reward" silently yields 0.0
+    # for every trajectory, which zeroes the GRPO advantages at
+    # rl_program.py:352 -- not just the metric -- and makes training a no-op
+    # no matter how good the completions are.
+    if "reward" in traj:
+      return float(traj["reward"] or 0.0)
+    return float(traj.get("trajectory_reward") or 0.0)
   if hasattr(traj, "reward"):
     return float(getattr(traj, "reward", 0.0))
   if isinstance(item, dict):

@@ -5,7 +5,7 @@
 # MaxText under /app/maxtext, the Raiden FFI bridge, and a tunix checkout at
 # /app/tunix that PYTHONPATH=/app makes win over the pip-installed copy).
 #
-# Eight source files are patched here -- seven under /app/tunix and one under
+# Nine source files are patched here -- eight under /app/tunix and one under
 # /app/maxtext. Everything else -- the launcher, the YAML generator, the Kueue
 # priority label -- runs on the host and needs no image change. Keep this
 # overlay this small: the base image's tunix is a different lineage from
@@ -46,6 +46,13 @@
 #        is marked MAX_CONTEXT_LIMIT_REACHED, skips _append_final_reward and
 #        never reaches env.step -- so it scores a hard 0.0 and is invisible to
 #        the example's own completion logging, which hangs off env.step.
+#   9. experimental/orchestrator/rl_program.py
+#        read the episode reward from the key the rollout actually emits.
+#        _extract_reward looked only for traj["reward"], but Token mode --
+#        the mode this path runs in -- emits "trajectory_reward". Every
+#        trajectory therefore scored 0.0, which zeroes not just the logged
+#        reward_mean but the GRPO advantages fed to create_trainer_payloads,
+#        so the whole run was a no-op however good the completions were.
 ARG BASE_IMAGE=gcr.io/cloud-tpu-multipod-dev/yixuannwang_google_com-runner:yixuann-e2e-0912head-v8
 FROM ${BASE_IMAGE}
 
@@ -65,6 +72,8 @@ COPY tunix/experimental/examples/common/run_trainer_node.py \
      /app/tunix/experimental/examples/common/run_trainer_node.py
 COPY tunix/rl/agentic/trajectory/trajectory_collect_engine.py \
      /app/tunix/rl/agentic/trajectory/trajectory_collect_engine.py
+COPY tunix/experimental/orchestrator/rl_program.py \
+     /app/tunix/experimental/orchestrator/rl_program.py
 
 # Fail the build rather than the job if a path above ever moves. The MaxText
 # file is checked as text: importing maxtext.training_engine at build time
@@ -81,4 +90,6 @@ assert '_COMPLETION_LOG_BUDGET' in inspect.getsource(g), g.__file__; \
 assert 'max_seq_token_per_tpu' in inspect.signature(m.build_maxtext_config).parameters, m.__file__; \
 import tunix.rl.agentic.trajectory.trajectory_collect_engine as t; \
 assert '_GEN_LOG_BUDGET' in inspect.getsource(t), t.__file__; \
+import tunix.experimental.orchestrator.rl_program as p; \
+assert 'trajectory_reward' in inspect.getsource(p._extract_reward), p.__file__; \
 print('overlay ok:', d.__file__)"

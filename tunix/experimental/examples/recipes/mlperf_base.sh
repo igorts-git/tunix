@@ -116,6 +116,30 @@ else
 fi
 export VLLM_MAMBA_CACHE_MODE="${VLLM_MAMBA_CACHE_MODE:-${MAMBA_CACHE_MODE}}"
 
+# FP8 rollout: ROLLOUT_FP8=true stores the rollout's routed-expert weights (wi/wo)
+# in float8_e4m3fn with per-output-channel scales, and the fused MoE kernel then
+# quantizes its activations to FP8 too (W8A8 on the MXU). Every other weight and
+# the trainer stay bf16/fp32. The trainer's weight converter quantizes the
+# experts on every sync against the rollout's target state.
+export ROLLOUT_FP8="${ROLLOUT_FP8:-false}"
+if [[ "${ROLLOUT_FP8}" == "true" ]]; then
+  VLLM_ADDITIONAL_CONFIG="$(python3 -c '
+import json, os
+cfg = json.loads(os.environ.get("VLLM_ADDITIONAL_CONFIG") or "{}")
+cfg.setdefault("maxtext_config", {}).update({"fp8_moe": True})
+print(json.dumps(cfg, separators=(",", ":")))
+')"
+  export VLLM_ADDITIONAL_CONFIG
+  export MAXTEXT_EXTRA_FLAGS="${MAXTEXT_EXTRA_FLAGS} rollout_fp8_moe=true"
+fi
+# TRAINER_FP8=true rounds the trainer's routed-expert weights to the same FP8 grid
+# in the forward pass (straight-through gradients, bf16 master weights), so the
+# trainer computes log-probs with the weights the ROLLOUT_FP8 rollout serves.
+export TRAINER_FP8="${TRAINER_FP8:-false}"
+if [[ "${TRAINER_FP8}" == "true" ]]; then
+  export MAXTEXT_EXTRA_FLAGS="${MAXTEXT_EXTRA_FLAGS} fp8_moe_fake_quant=true"
+fi
+
 # Router replay
 export RETURN_ROUTED_EXPERTS="${RETURN_ROUTED_EXPERTS:-true}"
 

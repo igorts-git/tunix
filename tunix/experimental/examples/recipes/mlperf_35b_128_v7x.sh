@@ -11,8 +11,8 @@ export MAXTEXT_OUTPUT_DIR="${MAXTEXT_OUTPUT_DIR:-gs://atwigg-trellis-us-central1
 export TRAJECTORY_LOG_DIR="${TRAJECTORY_LOG_DIR:-gs://atwigg-trellis-us-central1/trajectories/${JOB_PREFIX}/logger}"
 export TRAJECTORY_STORE_ROOT_DIR="${TRAJECTORY_STORE_ROOT_DIR:-${TRAJECTORY_STORE_ROOT:-gs://atwigg-trellis-us-central1/trajectories/${JOB_PREFIX}/store}}"
 
-export REGION="us-central1"
-export CLUSTER="bodaborg-tpu7x-gsc"
+export REGION="${REGION:-us-central1}"
+export CLUSTER="${CLUSTER:-bodaborg-tpu7x-gsc}"
 export K8S_NAMESPACE="priority-dev"
 export USE_DYNAMIC_SLICING="true"
 export TPU_RESERVATION="${TPU_RESERVATION:-ghostfish-pogoag4tylwed}"

@@ -14,6 +14,7 @@ COLS = {
     "compl": "rollout/completion_length_mean",
     "seqs": "rollout/global_valid_seqs",
     "oob": "trainer/tis/is_oob_ratio",
+    "kept": "trainer/sample_mask/kept_frac",
     "ld_absmean": "trainer/sampler_is/token_logdiff_absmean",
     "ld_mean": "trainer/sampler_is/token_logdiff_mean",
     "reward": "rewards/mean",
@@ -34,7 +35,7 @@ for v in ("bf16", "r8", "r8t8"):
     continue
   h = h.rename(columns={P + c: k for k, c in COLS.items()})
   h["gen_tok_s"] = h["compl"] * h["seqs"] / h["gen_s"]
-  show = ["_step", "step_s", "gen_s", "train_s", "sync_s", "gen_tok_s", "compl", "oob", "ld_absmean", "ld_mean", "reward"]
+  show = ["_step", "step_s", "gen_s", "train_s", "sync_s", "gen_tok_s", "compl", "oob", "kept", "ld_absmean", "ld_mean", "reward"]
   show = [c for c in show if c in h]
   if verbose:
     print(h[show].to_string(index=False, float_format=lambda x: f"{x:.4g}"))
